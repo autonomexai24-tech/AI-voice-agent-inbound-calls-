@@ -15,3 +15,10 @@ __pycache__/
 # Local/generated files
 .DS_Store
 *.log
+
+# Frontend generated files
+node_modules/
+.next/
+frontend/node_modules/
+frontend/.next/
+frontend/out/

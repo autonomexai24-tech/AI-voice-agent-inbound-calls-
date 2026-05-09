@@ -13,6 +13,8 @@ from __future__ import annotations
 from typing import Optional
 from uuid import UUID
 
+from psycopg2.extras import Json
+
 from backend.db.connection import get_connection
 from backend.utils.logging import get_logger
 
@@ -143,6 +145,8 @@ def update_tenant_config(tenant_id: UUID, updates: dict) -> None:
     clean = {k: v for k, v in updates.items() if k in allowed}
     if not clean:
         return
+    if "business_hours_json" in clean and clean["business_hours_json"] is not None:
+        clean["business_hours_json"] = Json(clean["business_hours_json"])
 
     set_clause = ", ".join(f"{col} = %s" for col in clean)
     params = list(clean.values()) + [str(tenant_id)]

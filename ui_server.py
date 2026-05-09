@@ -1,11 +1,18 @@
 import json
 import logging
 import os
-from fastapi import FastAPI, Request
+import base64
+import hashlib
+import hmac
+import time
+from uuid import UUID
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from dotenv import load_dotenv
 from backend.core.health import aggregate_health
 from backend.core.startup import run_startup_checks
+from backend.db.connection import get_connection, is_postgres_enabled
 
 load_dotenv()
 
@@ -20,6 +27,8 @@ async def startup_event():
     run_startup_checks("api")
 
 CONFIG_FILE = "config.json"
+SESSION_COOKIE = "rapid_session"
+SESSION_TTL_SECONDS = 60 * 60 * 12
 
 def read_config():
     config = {}
@@ -58,21 +67,319 @@ def write_config(data):
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
 
+def _session_secret() -> bytes:
+    secret = (
+        os.environ.get("SESSION_SECRET")
+        or os.environ.get("DASHBOARD_SESSION_SECRET")
+        or os.environ.get("LIVEKIT_API_SECRET")
+        or "dev-session-secret"
+    )
+    return secret.encode("utf-8")
+
+def _b64encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+def _b64decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode((data + padding).encode("ascii"))
+
+def _sign_session(payload: str) -> str:
+    return hmac.new(_session_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def _create_session(user: dict) -> str:
+    payload = {
+        "email": user["email"],
+        "tenant_id": user["tenant_id"],
+        "tenant_name": user.get("tenant_name") or "RapidX AI",
+        "tenant_slug": user.get("tenant_slug") or "default",
+        "exp": int(time.time()) + SESSION_TTL_SECONDS,
+    }
+    encoded = _b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    return f"{encoded}.{_sign_session(encoded)}"
+
+def _read_session(request: Request) -> dict | None:
+    raw = request.cookies.get(SESSION_COOKIE)
+    if not raw or "." not in raw:
+        return None
+    payload, signature = raw.rsplit(".", 1)
+    if not hmac.compare_digest(_sign_session(payload), signature):
+        return None
+    try:
+        data = json.loads(_b64decode(payload))
+    except Exception:
+        return None
+    if int(data.get("exp", 0)) < int(time.time()):
+        return None
+    return data
+
+def require_session(request: Request) -> dict:
+    session = _read_session(request)
+    if not session:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return session
+
+async def _json_body(request: Request) -> dict:
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+    return data
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    if not stored_hash:
+        return False
+    if stored_hash.startswith("pbkdf2_sha256$"):
+        try:
+            _, rounds, salt, digest = stored_hash.split("$", 3)
+            computed = hashlib.pbkdf2_hmac(
+                "sha256",
+                password.encode("utf-8"),
+                salt.encode("utf-8"),
+                int(rounds),
+            ).hex()
+            return hmac.compare_digest(computed, digest)
+        except Exception:
+            return False
+    if stored_hash.startswith("sha256$"):
+        try:
+            _, salt, digest = stored_hash.split("$", 2)
+            computed = hashlib.sha256(f"{salt}{password}".encode("utf-8")).hexdigest()
+            return hmac.compare_digest(computed, digest)
+        except Exception:
+            return False
+    if stored_hash.startswith("plain$"):
+        return hmac.compare_digest(stored_hash[6:], password)
+    return False
+
+def _env_login(email: str, password: str) -> dict | None:
+    expected_email = os.environ.get("DASHBOARD_EMAIL") or os.environ.get("ADMIN_EMAIL")
+    expected_password = os.environ.get("DASHBOARD_PASSWORD") or os.environ.get("ADMIN_PASSWORD")
+    if not expected_email or not expected_password:
+        return None
+    if not hmac.compare_digest(email.strip().lower(), expected_email.strip().lower()):
+        return None
+    if not hmac.compare_digest(password, expected_password):
+        return None
+    return {
+        "email": expected_email,
+        "tenant_id": os.environ.get("DASHBOARD_TENANT_ID") or os.environ.get("TENANT_ID") or "legacy",
+        "tenant_name": os.environ.get("DASHBOARD_TENANT_NAME") or "RapidX AI",
+        "tenant_slug": os.environ.get("DASHBOARD_TENANT_SLUG") or "default",
+    }
+
+def _postgres_login(email: str, password: str) -> dict | None:
+    if not is_postgres_enabled():
+        return None
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT u.email, u.password_hash, u.tenant_id, t.name, t.slug
+                    FROM users u
+                    JOIN tenants t ON t.id = u.tenant_id
+                    WHERE lower(u.email) = lower(%s)
+                    LIMIT 1
+                    """,
+                    (email.strip(),),
+                )
+                row = cur.fetchone()
+    except Exception as exc:
+        logger.warning("Auth postgres lookup failed: %s", type(exc).__name__)
+        return None
+    if row is None or not _verify_password(password, row[1]):
+        return None
+    return {
+        "email": row[0],
+        "tenant_id": str(row[2]),
+        "tenant_name": row[3],
+        "tenant_slug": row[4],
+    }
+
+def _authenticate(email: str, password: str) -> dict | None:
+    return _postgres_login(email, password) or _env_login(email, password)
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    secure = (os.environ.get("SESSION_COOKIE_SECURE") or "").lower() == "true"
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=secure,
+        samesite="lax",
+        path="/",
+    )
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(SESSION_COOKIE, path="/")
+
+def _tenant_uuid(session: dict) -> UUID | None:
+    tenant_id = session.get("tenant_id")
+    if not tenant_id or tenant_id == "legacy":
+        return None
+    try:
+        return UUID(str(tenant_id))
+    except ValueError:
+        return None
+
+def _safe_config(config: dict) -> dict:
+    hidden = {
+        "livekit_api_key",
+        "livekit_api_secret",
+        "openai_api_key",
+        "sarvam_api_key",
+        "cal_api_key",
+        "telegram_bot_token",
+        "telegram_chat_id",
+        "supabase_key",
+        "vobiz_password",
+    }
+    return {k: v for k, v in config.items() if k not in hidden}
+
+def _legacy_config_for_response() -> dict:
+    cfg = _safe_config(read_config())
+    cfg.setdefault("business_name", os.environ.get("DASHBOARD_TENANT_NAME") or "RapidX AI")
+    cfg.setdefault("business_phone", "")
+    cfg.setdefault("transfer_number", os.environ.get("DEFAULT_TRANSFER_NUMBER", ""))
+    cfg.setdefault("business_hours_json", "")
+    return cfg
+
+def _postgres_config_for_response(session: dict) -> dict | None:
+    tenant_id = _tenant_uuid(session)
+    if not tenant_id or not is_postgres_enabled():
+        return None
+    try:
+        from backend.db.tenants import get_tenant_by_id, get_tenant_config
+
+        tenant = get_tenant_by_id(tenant_id)
+        cfg = get_tenant_config(tenant_id) or {}
+    except Exception as exc:
+        logger.warning("Tenant config fetch failed: %s", type(exc).__name__)
+        return None
+    business_hours = cfg.get("business_hours_json")
+    if business_hours and not isinstance(business_hours, str):
+        business_hours = json.dumps(business_hours, indent=2)
+    return {
+        "business_name": (tenant or {}).get("name") or session.get("tenant_name") or "",
+        "business_phone": (tenant or {}).get("phone_number") or "",
+        "agent_instructions": cfg.get("agent_instructions") or "",
+        "first_line": cfg.get("first_line") or "",
+        "tts_voice": cfg.get("tts_voice") or "kavya",
+        "tts_language": cfg.get("tts_language") or "hi-IN",
+        "lang_preset": cfg.get("lang_preset") or "multilingual",
+        "llm_model": cfg.get("llm_model") or "gpt-4o-mini",
+        "stt_min_endpointing_delay": cfg.get("endpointing_delay") or 0.5,
+        "business_hours_json": business_hours or "",
+        "transfer_number": cfg.get("transfer_number") or "",
+        "cal_event_type_id": cfg.get("cal_event_type_id") or "",
+        "config_source": "postgres",
+    }
+
+def _update_postgres_config(session: dict, data: dict) -> bool:
+    tenant_id = _tenant_uuid(session)
+    if not tenant_id or not is_postgres_enabled():
+        return False
+    updates = {}
+    tenant_updates = {}
+    mapping = {
+        "agent_instructions": "agent_instructions",
+        "first_line": "first_line",
+        "tts_voice": "tts_voice",
+        "tts_language": "tts_language",
+        "lang_preset": "lang_preset",
+        "llm_model": "llm_model",
+        "stt_min_endpointing_delay": "endpointing_delay",
+        "business_hours_json": "business_hours_json",
+        "transfer_number": "transfer_number",
+        "cal_event_type_id": "cal_event_type_id",
+    }
+    for public_key, db_key in mapping.items():
+        if public_key in data:
+            value = data[public_key]
+            if public_key == "business_hours_json":
+                if value in ("", None):
+                    value = None
+                elif isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except json.JSONDecodeError:
+                        raise HTTPException(status_code=400, detail="Business hours must be valid JSON")
+            updates[db_key] = value
+    if "business_name" in data:
+        tenant_updates["name"] = data["business_name"]
+    if "business_phone" in data:
+        tenant_updates["phone_number"] = data["business_phone"]
+
+    if updates:
+        from backend.db.tenants import update_tenant_config
+
+        update_tenant_config(tenant_id, updates)
+
+    if tenant_updates:
+        set_clause = ", ".join(f"{column} = %s" for column in tenant_updates)
+        params = list(tenant_updates.values()) + [str(tenant_id)]
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE tenants
+                    SET {set_clause}
+                    WHERE id = %s
+                    """,
+                    params,
+                )
+    return True
+
 # ── API Endpoints ──────────────────────────────────────────────────────────────
 
+@app.post("/api/auth/login")
+async def api_auth_login(request: Request, response: Response):
+    data = await _json_body(request)
+    email = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required")
+    user = _authenticate(email, password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    _set_session_cookie(response, _create_session(user))
+    return {"user": {k: user[k] for k in ("email", "tenant_id", "tenant_name", "tenant_slug")}}
+
+@app.post("/api/auth/logout")
+async def api_auth_logout(response: Response):
+    _clear_session_cookie(response)
+    return {"ok": True}
+
+@app.get("/api/auth/me")
+async def api_auth_me(user: dict = Depends(require_session)):
+    return {"user": user}
+
 @app.get("/api/config")
-async def api_get_config():
-    return read_config()
+async def api_get_config(user: dict = Depends(require_session)):
+    return jsonable_encoder(_postgres_config_for_response(user) or _legacy_config_for_response())
 
 @app.post("/api/config")
-async def api_post_config(request: Request):
-    data = await request.json()
-    write_config(data)
+async def api_post_config(request: Request, user: dict = Depends(require_session)):
+    data = await _json_body(request)
+    if not _update_postgres_config(user, data):
+        write_config(data)
     logger.info("Configuration updated via UI.")
     return {"status": "success"}
 
 @app.get("/api/logs")
-async def api_get_logs():
+async def api_get_logs(user: dict = Depends(require_session)):
+    tenant_id = _tenant_uuid(user)
+    if tenant_id and is_postgres_enabled():
+        try:
+            from backend.db.call_logs import fetch_call_logs
+
+            return jsonable_encoder(fetch_call_logs(tenant_id, limit=50))
+        except Exception as e:
+            logger.error(f"Error fetching tenant logs: {type(e).__name__}")
+            return []
     config = read_config()
     os.environ["SUPABASE_URL"] = config.get("supabase_url", "")
     os.environ["SUPABASE_KEY"] = config.get("supabase_key", "")
@@ -85,7 +392,28 @@ async def api_get_logs():
         return []
 
 @app.get("/api/logs/{log_id}/transcript")
-async def api_get_transcript(log_id: str):
+async def api_get_transcript(log_id: str, user: dict = Depends(require_session)):
+    tenant_id = _tenant_uuid(user)
+    if tenant_id and is_postgres_enabled():
+        try:
+            from backend.db.call_logs import get_call_log
+
+            row = get_call_log(tenant_id, UUID(log_id))
+            if row is None:
+                return PlainTextResponse(content="Not found", status_code=404)
+            text = f"Call Log - {row.get('created_at', '')}\n"
+            text += f"Phone: {row.get('phone_number', 'Unknown')}\n"
+            text += f"Duration: {row.get('duration_seconds', 0)}s\n"
+            text += f"Summary: {row.get('summary', '')}\n\n"
+            text += "--- TRANSCRIPT ---\n"
+            text += row.get("transcript") or "No transcript available."
+            return PlainTextResponse(
+                content=text,
+                media_type="text/plain",
+                headers={"Content-Disposition": f"attachment; filename=transcript_{log_id}.txt"},
+            )
+        except Exception as e:
+            return PlainTextResponse(content=f"Error: {type(e).__name__}", status_code=500)
     config = read_config()
     os.environ["SUPABASE_URL"] = config.get("supabase_url", "")
     os.environ["SUPABASE_KEY"] = config.get("supabase_key", "")
@@ -107,7 +435,16 @@ async def api_get_transcript(log_id: str):
         return PlainTextResponse(content=f"Error: {e}", status_code=500)
 
 @app.get("/api/bookings")
-async def api_get_bookings():
+async def api_get_bookings(user: dict = Depends(require_session)):
+    tenant_id = _tenant_uuid(user)
+    if tenant_id and is_postgres_enabled():
+        try:
+            from backend.db.bookings import fetch_bookings
+
+            return jsonable_encoder(fetch_bookings(tenant_id, limit=200))
+        except Exception as e:
+            logger.error(f"Error fetching tenant bookings: {type(e).__name__}")
+            return []
     config = read_config()
     os.environ["SUPABASE_URL"] = config.get("supabase_url", "")
     os.environ["SUPABASE_KEY"] = config.get("supabase_key", "")
@@ -119,7 +456,16 @@ async def api_get_bookings():
         return []
 
 @app.get("/api/stats")
-async def api_get_stats():
+async def api_get_stats(user: dict = Depends(require_session)):
+    tenant_id = _tenant_uuid(user)
+    if tenant_id and is_postgres_enabled():
+        try:
+            from backend.db.call_logs import fetch_call_stats
+
+            return jsonable_encoder(fetch_call_stats(tenant_id))
+        except Exception as e:
+            logger.error(f"Error fetching tenant stats: {type(e).__name__}")
+            return {"total_calls": 0, "total_bookings": 0, "avg_duration": 0, "booking_rate": 0}
     config = read_config()
     os.environ["SUPABASE_URL"] = config.get("supabase_url", "")
     os.environ["SUPABASE_KEY"] = config.get("supabase_key", "")
@@ -131,8 +477,32 @@ async def api_get_stats():
         return {"total_calls": 0, "total_bookings": 0, "avg_duration": 0, "booking_rate": 0}
 
 @app.get("/api/contacts")
-async def api_get_contacts():
+async def api_get_contacts(user: dict = Depends(require_session)):
     """CRM endpoint — groups call_logs by phone number, deduplicates into contacts."""
+    tenant_id = _tenant_uuid(user)
+    if tenant_id and is_postgres_enabled():
+        try:
+            from backend.db.call_logs import fetch_call_logs
+
+            rows = fetch_call_logs(tenant_id, limit=500)
+            contacts: dict = {}
+            for row in rows:
+                phone = row.get("phone_number") or "unknown"
+                if phone not in contacts:
+                    contacts[phone] = {
+                        "phone_number": phone,
+                        "caller_name": "",
+                        "total_calls": 0,
+                        "last_seen": row.get("created_at"),
+                        "is_booked": False,
+                    }
+                contacts[phone]["total_calls"] += 1
+                if row.get("summary") and "Confirmed" in row.get("summary", ""):
+                    contacts[phone]["is_booked"] = True
+            return jsonable_encoder(sorted(contacts.values(), key=lambda x: x["last_seen"] or "", reverse=True))
+        except Exception as e:
+            logger.error(f"Error fetching tenant contacts: {type(e).__name__}")
+            return []
     config = read_config()
     os.environ["SUPABASE_URL"] = config.get("supabase_url", "")
     os.environ["SUPABASE_KEY"] = config.get("supabase_key", "")
