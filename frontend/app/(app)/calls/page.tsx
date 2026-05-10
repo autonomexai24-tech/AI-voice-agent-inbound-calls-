@@ -10,6 +10,9 @@ export default function CallsPage() {
   const [calls, setCalls] = useState<CallLog[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [recordingUrls, setRecordingUrls] = useState<Record<string, string>>({});
+  const [recordingLoading, setRecordingLoading] = useState<Record<string, boolean>>({});
+  const [recordingError, setRecordingError] = useState<Record<string, string>>({});
 
   function load() {
     setLoading(true);
@@ -26,6 +29,22 @@ export default function CallsPage() {
   }
 
   useEffect(load, []);
+
+  async function loadRecording(recordingId: string) {
+    setRecordingLoading((current) => ({ ...current, [recordingId]: true }));
+    setRecordingError((current) => ({ ...current, [recordingId]: "" }));
+    try {
+      const response = await apiFetch<{ url: string; expires_in: number }>(`/api/recordings/${recordingId}/playback`);
+      setRecordingUrls((current) => ({ ...current, [recordingId]: response.url }));
+    } catch (err) {
+      setRecordingError((current) => ({
+        ...current,
+        [recordingId]: err instanceof Error ? err.message : "Recording unavailable",
+      }));
+    } finally {
+      setRecordingLoading((current) => ({ ...current, [recordingId]: false }));
+    }
+  }
 
   if (loading) return <LoadingBlock label="Loading calls" />;
   if (error) return <ErrorState message={error} onRetry={load} />;
@@ -45,6 +64,7 @@ export default function CallsPage() {
                   <th className="px-5 py-3">Summary</th>
                   <th className="px-5 py-3">Time</th>
                   <th className="px-5 py-3">Transcript</th>
+                  <th className="px-5 py-3">Recording</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-line bg-white">
@@ -69,6 +89,31 @@ export default function CallsPage() {
                         >
                           Download
                         </a>
+                      ) : (
+                        "-"
+                      )}
+                    </td>
+                    <td className="min-w-56 px-5 py-4">
+                      {call.recording_id && call.recording_upload_status === "uploaded" ? (
+                        <div className="space-y-2">
+                          {recordingUrls[call.recording_id] ? (
+                            <audio controls src={recordingUrls[call.recording_id]} className="h-10 w-56 max-w-full" />
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => loadRecording(call.recording_id as string)}
+                              disabled={recordingLoading[call.recording_id]}
+                              className="focus-ring rounded-md border border-line px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+                            >
+                              {recordingLoading[call.recording_id] ? "Loading" : "Play"}
+                            </button>
+                          )}
+                          {recordingError[call.recording_id] ? (
+                            <div className="text-xs font-medium text-danger">{recordingError[call.recording_id]}</div>
+                          ) : null}
+                        </div>
+                      ) : call.recording_upload_status ? (
+                        <StatusPill value={call.recording_upload_status} />
                       ) : (
                         "-"
                       )}

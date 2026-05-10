@@ -38,11 +38,14 @@ CREATE TABLE IF NOT EXISTS tenants (
     name          TEXT NOT NULL,
     slug          TEXT NOT NULL UNIQUE,
     phone_number  TEXT NOT NULL UNIQUE,
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Lookups by DID happen on every inbound call; slug is for admin/UI routing.
 CREATE INDEX IF NOT EXISTS idx_tenants_phone_number ON tenants (phone_number);
+CREATE INDEX IF NOT EXISTS idx_tenants_phone_digits
+    ON tenants ((regexp_replace(phone_number, '[^0-9]', '', 'g')));
 CREATE INDEX IF NOT EXISTS idx_tenants_slug         ON tenants (slug);
 
 
@@ -139,19 +142,22 @@ CREATE INDEX IF NOT EXISTS idx_bookings_call_log
 -- (e.g. future admin-triggered messages).
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS notification_events (
-    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id    UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    call_log_id  UUID REFERENCES call_logs(id) ON DELETE SET NULL,
-    channel      TEXT NOT NULL,       -- 'sms', 'webhook', ...
-    recipient    TEXT,
-    status       TEXT,                -- 'sent', 'failed', 'pending'
-    sent_at      TIMESTAMPTZ
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id      UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    call_id        TEXT,
+    phone_number   TEXT NOT NULL,
+    message        TEXT NOT NULL,
+    provider       TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'sent', 'failed')),
+    error_message  TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_notification_events_tenant
-    ON notification_events (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_notification_events_call_log
-    ON notification_events (call_log_id);
+CREATE INDEX IF NOT EXISTS idx_notification_events_tenant_created
+    ON notification_events (tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_events_call_id
+    ON notification_events (call_id);
 
 
 -- ----------------------------------------------------------------------------
@@ -163,9 +169,13 @@ CREATE TABLE IF NOT EXISTS call_recordings (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id         UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     call_log_id       UUID REFERENCES call_logs(id) ON DELETE CASCADE,
+    call_id           TEXT NOT NULL,
     storage_key       TEXT NOT NULL,
+    recording_url     TEXT,
     duration_seconds  INTEGER,
-    size_bytes        BIGINT,
+    file_size         BIGINT,
+    upload_status     TEXT NOT NULL DEFAULT 'pending'
+        CHECK (upload_status IN ('pending', 'uploaded', 'failed')),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -173,6 +183,8 @@ CREATE INDEX IF NOT EXISTS idx_call_recordings_tenant
     ON call_recordings (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_call_recordings_call_log
     ON call_recordings (call_log_id);
+CREATE INDEX IF NOT EXISTS idx_call_recordings_call_id
+    ON call_recordings (call_id);
 
 COMMIT;
 

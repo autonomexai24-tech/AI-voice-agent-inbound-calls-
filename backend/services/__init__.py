@@ -10,18 +10,13 @@ complexity, no caches, no queues. Each service is roughly a facade.
 
 from backend.services.tenant_service import TenantService
 from backend.services.booking_service import BookingService
-from backend.services.notification_service import (
-    NotificationService,
-    NotificationChannel,
-    NotificationResult,
-)
+from backend.services.notification_service import NotificationService, send_booking_confirmation_sms
 from backend.services.recording_service import RecordingService
 
 __all__ = [
     "TenantService",
     "BookingService",
     "NotificationService",
-    "NotificationChannel",
-    "NotificationResult",
+    "send_booking_confirmation_sms",
     "RecordingService",
 ]

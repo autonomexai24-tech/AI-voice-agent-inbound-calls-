@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
+from contextvars import ContextVar
 from typing import Optional
 
 from pythonjsonlogger import jsonlogger
@@ -35,13 +37,24 @@ _STANDARD_FIELDS = (
     "name",
     "service",
     "message",
+    "request_id",
     "call_id",
     "tenant_id",
+    "did",
     "operation",
     "error_type",
 )
 
 _configured = False
+_request_id_ctx: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
+_tenant_id_ctx: ContextVar[Optional[str]] = ContextVar("tenant_id", default=None)
+_call_id_ctx: ContextVar[Optional[str]] = ContextVar("call_id", default=None)
+_did_ctx: ContextVar[Optional[str]] = ContextVar("did", default=None)
+_REDACTION_PATTERNS = (
+    re.compile(r"(sk-[A-Za-z0-9_\-]{12,})"),
+    re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]+", re.IGNORECASE),
+    re.compile(r"((?:api[_-]?key|token|secret|password)=)[^&\s]+", re.IGNORECASE),
+)
 
 
 def configure_logging(
@@ -64,7 +77,10 @@ def configure_logging(
     # Use a JsonFormatter that renames standard fields to match the schema
     # documented in EXECUTION.md §9.
     formatter = jsonlogger.JsonFormatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+        fmt=(
+            "%(asctime)s %(levelname)s %(name)s %(service)s %(request_id)s "
+            "%(tenant_id)s %(call_id)s %(did)s %(message)s"
+        ),
         rename_fields={
             "asctime": "timestamp",
             "levelname": "level",
@@ -75,6 +91,7 @@ def configure_logging(
 
     handler = logging.StreamHandler(stream=sys.stdout)
     handler.setFormatter(formatter)
+    handler.addFilter(_CorrelationFilter(service))
 
     root = logging.getLogger()
     # Drop any previously configured handlers to avoid duplicate lines.
@@ -82,23 +99,35 @@ def configure_logging(
     root.addHandler(handler)
     root.setLevel(resolved_level)
 
-    # Tag every record with the service name via a filter. This way every
-    # log line from any module includes "service" without the caller having
-    # to pass it in `extra`.
-    root.addFilter(_ServiceTagFilter(service))
-
     _configured = True
 
 
-class _ServiceTagFilter(logging.Filter):
-    """Filter that attaches the service name to every log record."""
+class _CorrelationFilter(logging.Filter):
+    """Attach service/correlation defaults and redact common secret shapes."""
 
     def __init__(self, service: str) -> None:
         super().__init__()
         self._service = service
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
-        record.service = self._service
+        record.service = getattr(record, "service", None) or self._service
+        record.request_id = getattr(record, "request_id", None) or _request_id_ctx.get() or "-"
+        record.tenant_id = getattr(record, "tenant_id", None) or _tenant_id_ctx.get() or "-"
+        record.call_id = getattr(record, "call_id", None) or _call_id_ctx.get() or "-"
+        record.did = getattr(record, "did", None) or _did_ctx.get() or "-"
+        if isinstance(record.msg, str):
+            record.msg = _redact_text(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(_redact_value(arg) for arg in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {key: _redact_value(value) for key, value in record.args.items()}
+        for key, value in list(record.__dict__.items()):
+            if key in {"msg", "args", "exc_info", "exc_text", "stack_info"}:
+                continue
+            if _looks_sensitive_key(key):
+                setattr(record, key, "[REDACTED]")
+            else:
+                setattr(record, key, _redact_value(value))
         return True
 
 
@@ -119,6 +148,7 @@ def bind_context(
     *,
     call_id: Optional[str] = None,
     tenant_id: Optional[str] = None,
+    did: Optional[str] = None,
     **extra: object,
 ) -> logging.LoggerAdapter:
     """Return a LoggerAdapter that injects call/tenant context into every record.
@@ -139,8 +169,35 @@ def bind_context(
         bound["call_id"] = call_id
     if tenant_id is not None:
         bound["tenant_id"] = tenant_id
+    if did is not None:
+        bound["did"] = did
     bound.update(extra)
     return _ContextAdapter(logger, bound)
+
+
+def set_correlation_context(
+    *,
+    request_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    call_id: Optional[str] = None,
+    did: Optional[str] = None,
+):
+    """Set process-local log correlation values for the current async context."""
+    tokens = []
+    if request_id is not None:
+        tokens.append((_request_id_ctx, _request_id_ctx.set(request_id)))
+    if tenant_id is not None:
+        tokens.append((_tenant_id_ctx, _tenant_id_ctx.set(tenant_id)))
+    if call_id is not None:
+        tokens.append((_call_id_ctx, _call_id_ctx.set(call_id)))
+    if did is not None:
+        tokens.append((_did_ctx, _did_ctx.set(did)))
+    return tokens
+
+
+def reset_correlation_context(tokens) -> None:
+    for ctx_var, token in reversed(tokens or []):
+        ctx_var.reset(token)
 
 
 class _ContextAdapter(logging.LoggerAdapter):
@@ -151,3 +208,26 @@ class _ContextAdapter(logging.LoggerAdapter):
         merged = {**self.extra, **existing}
         kwargs["extra"] = merged
         return msg, kwargs
+
+
+def _redact_value(value):
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value
+
+
+def _redact_text(value: str) -> str:
+    redacted = value
+    for pattern in _REDACTION_PATTERNS:
+        if pattern.pattern.startswith("(Bearer"):
+            redacted = pattern.sub(r"\1[REDACTED]", redacted)
+        elif "api" in pattern.pattern:
+            redacted = pattern.sub(r"\1[REDACTED]", redacted)
+        else:
+            redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
+def _looks_sensitive_key(key: str) -> bool:
+    lowered = key.lower()
+    return any(part in lowered for part in ("password", "secret", "api_key", "apikey", "token"))

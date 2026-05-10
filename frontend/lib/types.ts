@@ -3,6 +3,8 @@ export type User = {
   tenant_id: string;
   tenant_name: string;
   tenant_slug: string;
+  tenant_phone?: string;
+  tenant_active?: boolean;
 };
 
 export type Stats = {
@@ -23,6 +25,8 @@ export type CallLog = {
   sentiment?: string;
   created_at?: string;
   recording_url?: string;
+  recording_id?: string;
+  recording_upload_status?: string;
 };
 
 export type Booking = {
@@ -43,6 +47,8 @@ export type Booking = {
 export type Config = {
   business_name?: string;
   business_phone?: string;
+  tenant_slug?: string;
+  tenant_active?: boolean;
   agent_instructions?: string;
   first_line?: string;
   tts_voice?: string;

@@ -18,6 +18,7 @@ class Tenant:
     name: str
     slug: str
     phone_number: str
+    is_active: bool
     created_at: datetime
 
 
@@ -77,11 +78,13 @@ class Booking:
 class NotificationEvent:
     id: UUID
     tenant_id: UUID
-    call_log_id: Optional[UUID]
-    channel: str
-    recipient: Optional[str]
-    status: Optional[str]
-    sent_at: Optional[datetime]
+    call_id: Optional[str]
+    phone_number: str
+    message: str
+    provider: str
+    status: str
+    error_message: Optional[str]
+    created_at: datetime
 
 
 @dataclass(frozen=True)
@@ -89,7 +92,10 @@ class CallRecording:
     id: UUID
     tenant_id: UUID
     call_log_id: Optional[UUID]
+    call_id: str
     storage_key: str
+    recording_url: Optional[str]
     duration_seconds: Optional[int]
-    size_bytes: Optional[int]
+    file_size: Optional[int]
+    upload_status: str
     created_at: datetime

@@ -1,6 +1,9 @@
 # Environment variables
 .env
 .env.local
+config.json
+configs/
+google_creds.json
 
 # Python virtual environment
 .venv/

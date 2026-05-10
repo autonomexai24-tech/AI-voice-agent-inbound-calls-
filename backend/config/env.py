@@ -29,9 +29,7 @@ REQUIRED_CORE_ENV: tuple[str, ...] = (
     "SARVAM_API_KEY",
 )
 
-# Additional env vars required only when USE_POSTGRES=true. The legacy
-# Supabase env vars (SUPABASE_URL, SUPABASE_KEY) are NOT listed here; they
-# remain required by the existing db.py until Phase 2 migration completes.
+# Additional env vars required only when USE_POSTGRES=true.
 REQUIRED_POSTGRES_ENV: tuple[str, ...] = (
     "DATABASE_URL",
 )

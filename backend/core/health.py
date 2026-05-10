@@ -45,7 +45,6 @@ def aggregate_health(service: str = "ai-receptionist") -> dict[str, Any]:
     checks: dict[str, Any] = {
         "process": _process_status(),
         "postgres": postgres_healthcheck(),
-        "supabase_fallback": _supabase_fallback_status(),
         "config_source": get_config_source_status(),
         "startup_validation": _startup_validation_status(),
     }
@@ -83,18 +82,6 @@ def _process_status() -> dict[str, Any]:
         "status": "running",
         "pid": os.getpid(),
     }
-
-
-def _supabase_fallback_status() -> dict[str, Any]:
-    config = _read_config_json()
-    url_configured = bool(get_env("SUPABASE_URL") or config.get("supabase_url"))
-    key_configured = bool(get_env("SUPABASE_KEY") or config.get("supabase_key"))
-    return {
-        "status": "configured" if url_configured and key_configured else "not_configured",
-        "url_configured": url_configured,
-        "key_configured": key_configured,
-    }
-
 
 def _read_config_json() -> dict[str, Any]:
     if not os.path.exists(CONFIG_FILE):

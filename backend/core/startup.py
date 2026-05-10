@@ -92,9 +92,8 @@ def run_startup_checks(
         },
     )
 
-    # Pool init when enabled. Postgres is a coexistence path in Phase 3B:
-    # failures degrade to config.json/Supabase fallback and must not crash
-    # live calls.
+    # Pool init when enabled. Database failures are reported as degraded so
+    # live calls can still fail gracefully instead of crashing the process.
     if initialize_postgres and is_postgres_enabled():
         try:
             init_pool()

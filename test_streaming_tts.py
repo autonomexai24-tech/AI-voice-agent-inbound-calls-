@@ -1,5 +1,4 @@
-import asyncio, base64, os, time, certifi
-os.environ["SSL_CERT_FILE"] = certifi.where()
+import asyncio, base64, os, time
 from sarvamai import AsyncSarvamAI
 from sarvamai.types import AudioOutput, EventResponse
 

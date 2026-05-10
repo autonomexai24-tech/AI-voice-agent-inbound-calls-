@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
@@ -71,7 +72,7 @@ def init_pool(
     """Initialize the global PostgreSQL connection pool.
 
     If USE_POSTGRES is not enabled, this is a no-op and returns None. This
-    allows existing Supabase-based runtime to start unchanged in Phase 1.
+    allows local non-PostgreSQL test processes to start unchanged.
 
     If USE_POSTGRES is enabled, this validates env vars and opens the pool.
     Raises RuntimeError on misconfiguration (fail-fast).
@@ -114,9 +115,9 @@ def init_pool(
         except psycopg2.Error as e:
             logger.error(
                 "postgres.pool.init_failed",
-                extra={"error": str(e)},
+                extra={"error_type": type(e).__name__},
             )
-            raise RuntimeError(f"Failed to initialize PostgreSQL pool: {e}") from e
+            raise RuntimeError("Failed to initialize PostgreSQL pool") from e
 
         logger.info(
             "postgres.pool.initialized",
@@ -134,7 +135,7 @@ def close_pool() -> None:
                 _pool.closeall()
                 logger.info("postgres.pool.closed")
             except Exception as e:  # noqa: BLE001
-                logger.error("postgres.pool.close_error", extra={"error": str(e)})
+                logger.error("postgres.pool.close_error", extra={"error_type": type(e).__name__})
             _pool = None
 
 
@@ -153,6 +154,7 @@ def get_connection() -> Iterator[PGConnection]:
         )
 
     conn: PGConnection = _pool.getconn()
+    started = time.perf_counter()
     try:
         yield conn
         conn.commit()
@@ -163,6 +165,9 @@ def get_connection() -> Iterator[PGConnection]:
             pass
         raise
     finally:
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        if duration_ms >= float(os.environ.get("POSTGRES_SLOW_OPERATION_MS", "500")):
+            logger.warning("postgres.operation.slow", extra={"duration_ms": duration_ms})
         _pool.putconn(conn)
 
 
@@ -180,6 +185,17 @@ def healthcheck() -> dict:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
-        return {"postgres": "ok"}
+        return {"postgres": "ok", **_pool_stats()}
     except Exception as e:  # noqa: BLE001
-        return {"postgres": "error", "detail": str(e)[:200]}
+        return {"postgres": "error", "detail": type(e).__name__, **_pool_stats()}
+
+
+def _pool_stats() -> dict:
+    if _pool is None:
+        return {}
+    return {
+        "minconn": getattr(_pool, "minconn", None),
+        "maxconn": getattr(_pool, "maxconn", None),
+        "used": len(getattr(_pool, "_used", {}) or {}),
+        "available": len(getattr(_pool, "_pool", []) or []),
+    }

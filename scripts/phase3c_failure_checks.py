@@ -20,10 +20,8 @@ if str(ROOT) not in sys.path:
 
 from backend.core.config_resolver import resolve_runtime_config
 from backend.core.startup import run_startup_checks
-from backend.services.notification_service import (
-    NotificationResult,
-    NotificationService,
-)
+from backend.integrations.sms import SMSResult
+from backend.services.notification_service import NotificationService
 
 CRITICAL_ENV = (
     "LIVEKIT_URL",
@@ -37,19 +35,22 @@ OPTIONAL_ENV = (
     "CAL_API_KEY",
     "CAL_EVENT_TYPE_ID",
     "FAST2SMS_API_KEY",
-    "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID",
-    "SUPABASE_S3_ACCESS_KEY",
-    "SUPABASE_S3_SECRET_KEY",
-    "SUPABASE_S3_ENDPOINT",
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+    "S3_ENDPOINT",
 )
 
 
 class _FailingSMSProvider:
     name = "phase3c-failing-provider"
 
-    def send(self, to_phone: str, body: str) -> NotificationResult:
-        raise RuntimeError("simulated_sms_failure")
+    async def send_sms(self, phone_number: str, message: str) -> SMSResult:
+        return SMSResult(
+            provider=self.name,
+            phone_number=phone_number,
+            status="failed",
+            error_message="simulated_sms_failure",
+        )
 
 
 @contextmanager
@@ -60,14 +61,14 @@ def _patched_env(values: dict[str, str | None]) -> Iterator[None]:
             if value is None:
                 os.environ.pop(key, None)
             else:
-                os.environ[key] = value
+                os.environ.update({key: value})
         yield
     finally:
         for key, value in previous.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
-                os.environ[key] = value
+                os.environ.update({key: value})
 
 
 def check_postgres_unavailable() -> dict:
@@ -103,22 +104,26 @@ def check_missing_optional_integrations() -> dict:
     return {"ok": True, "expected": "optional integrations do not fail startup"}
 
 
-def check_sms_failure() -> dict:
-    result = NotificationService(_FailingSMSProvider()).send_sms(
-        "+919876543210",
-        "Phase 3C simulated SMS",
+async def check_sms_failure() -> dict:
+    result = await NotificationService(_FailingSMSProvider()).send_booking_confirmation_sms(
+        tenant_id=None,
+        call_id="phase3c-sms-failure",
+        caller_name="Phase3C Test",
+        caller_phone="+919876543210",
+        booking_time_iso="2026-05-09T10:00:00+05:30",
+        business_name="Phase3C Clinic",
     )
     return {
         "ok": result.status == "failed",
         "status": result.status,
-        "error": result.error,
+        "error": result.error_message,
     }
 
 
 async def check_calcom_failure() -> dict:
     import calendar_tools
 
-    async def _simulated_failure(start_time, caller_name, caller_phone, notes):
+    async def _simulated_failure(start_time, caller_name, caller_phone, notes, **kwargs):
         return {
             "success": False,
             "booking_id": None,
@@ -149,7 +154,7 @@ async def main() -> None:
         "postgres_unavailable": check_postgres_unavailable(),
         "missing_tenant_config_or_invalid_did": check_invalid_did_metadata(),
         "missing_optional_integrations": check_missing_optional_integrations(),
-        "sms_failure": check_sms_failure(),
+        "sms_failure": await check_sms_failure(),
         "calcom_failure": await check_calcom_failure(),
     }
     print(json.dumps(results, indent=2, sort_keys=True))

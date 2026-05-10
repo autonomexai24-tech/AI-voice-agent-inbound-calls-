@@ -33,7 +33,7 @@ export default function BusinessSettingsPage() {
                 onChange={(value) => setField("business_name", value)}
               />
               <Field
-                label="Business phone"
+                label="Inbound DID"
                 value={config.business_phone || ""}
                 onChange={(value) => setField("business_phone", value)}
               />

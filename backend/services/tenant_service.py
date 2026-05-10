@@ -15,7 +15,7 @@ Not yet wired to agent.py. Phase 3 will replace the current
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 from backend.db import tenants as tenant_repo
@@ -60,6 +60,33 @@ class TenantService:
 
     def get_by_id(self, tenant_id: UUID) -> Optional[dict]:
         return tenant_repo.get_tenant_by_id(tenant_id)
+
+    def list(self, limit: int = 100) -> list[dict]:
+        return tenant_repo.list_tenants(limit=limit)
+
+    def provision(
+        self,
+        *,
+        name: str,
+        phone_number: str,
+        user_email: str,
+        user_password: str,
+        slug: Optional[str] = None,
+        config: Optional[dict[str, Any]] = None,
+        is_active: bool = True,
+    ) -> dict:
+        return tenant_repo.provision_tenant(
+            name=name,
+            slug=slug,
+            phone_number=phone_number,
+            user_email=user_email,
+            user_password=user_password,
+            config=config,
+            is_active=is_active,
+        )
+
+    def update(self, tenant_id: UUID, updates: dict[str, Any]) -> bool:
+        return tenant_repo.update_tenant(tenant_id, updates)
 
     def update_config(self, tenant_id: UUID, updates: dict) -> None:
         tenant_repo.update_tenant_config(tenant_id, updates)

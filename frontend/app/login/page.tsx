@@ -10,6 +10,7 @@ function LoginForm() {
   const searchParams = useSearchParams();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [tenantSlug, setTenantSlug] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -19,7 +20,7 @@ function LoginForm() {
     setError("");
 
     try {
-      await postJson("/api/auth/login", { email, password });
+      await postJson("/api/auth/login", { email, password, tenant_slug: tenantSlug.trim() || undefined });
       router.replace(searchParams.get("next") || "/dashboard");
       router.refresh();
     } catch (err) {
@@ -56,6 +57,16 @@ function LoginForm() {
               type="password"
               autoComplete="current-password"
               required
+              className="focus-ring mt-2 min-h-11 w-full rounded-md border border-line px-3 text-sm shadow-sm"
+            />
+          </label>
+          <label className="block">
+            <span className="text-sm font-medium text-slate-700">Workspace</span>
+            <input
+              value={tenantSlug}
+              onChange={(event) => setTenantSlug(event.target.value)}
+              type="text"
+              autoComplete="organization"
               className="focus-ring mt-2 min-h-11 w-full rounded-md border border-line px-3 text-sm shadow-sm"
             />
           </label>

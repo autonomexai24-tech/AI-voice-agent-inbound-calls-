@@ -28,6 +28,7 @@ CONFIG_FILE = "config.json"
 
 _DEFAULT_CONFIG: dict[str, Any] = {
     "agent_instructions": "",
+    "first_line": "Namaste, thanks for calling. How can I help you today?",
     "stt_min_endpointing_delay": 0.05,
     "llm_model": "gpt-4o-mini",
     "llm_provider": "openai",
@@ -70,34 +71,33 @@ def resolve_runtime_config(
     did: Optional[str] = None,
 ) -> ResolvedRuntimeConfig:
     """Resolve call-start config without changing the existing call flow."""
-    json_config, json_source = _load_json_config(caller_phone)
-
     if is_postgres_enabled():
         if did:
-            resolved = _try_postgres_config(did=did, json_config=json_config)
+            resolved, fallback_reason = _try_postgres_config(did=did)
             if resolved is not None:
                 return resolved
             return _json_result(
-                json_config,
-                json_source,
-                fallback_reason="postgres_unavailable_or_unconfigured",
+                dict(_DEFAULT_CONFIG),
+                "environment_defaults",
+                fallback_reason=fallback_reason or "postgres_unavailable_or_unconfigured",
                 did=did,
             )
 
         logger.info(
             "config.source.selected",
             extra={
-                "source": json_source,
+                "source": "environment_defaults",
                 "postgres_enabled": True,
                 "fallback_reason": "did_missing",
             },
         )
         return _json_result(
-            json_config,
-            json_source,
+            dict(_DEFAULT_CONFIG),
+            "environment_defaults",
             fallback_reason="did_missing",
         )
 
+    json_config, json_source = _load_json_config(caller_phone)
     logger.info(
         "config.source.selected",
         extra={"source": json_source, "postgres_enabled": False},
@@ -111,13 +111,15 @@ def get_config_source_status() -> dict[str, Any]:
     This does not query PostgreSQL. Tenant config is resolved only at call
     start when a DID exists.
     """
-    _, json_source = _load_json_config(None)
     postgres_enabled = is_postgres_enabled()
+    json_source = "disabled_when_postgres_enabled"
+    if not postgres_enabled:
+        _, json_source = _load_json_config(None)
     return {
         "postgres_enabled": postgres_enabled,
         "json_source": json_source,
         "effective_priority": (
-            ["postgres_tenant_config", "json_config", "environment_defaults"]
+            ["postgres_tenant_config", "environment_defaults"]
             if postgres_enabled
             else ["json_config", "environment_defaults"]
         ),
@@ -127,8 +129,7 @@ def get_config_source_status() -> dict[str, Any]:
 def _try_postgres_config(
     *,
     did: str,
-    json_config: dict[str, Any],
-) -> Optional[ResolvedRuntimeConfig]:
+) -> tuple[Optional[ResolvedRuntimeConfig], Optional[str]]:
     try:
         resolved = TenantService().resolve_from_did(did)
     except TenantNotConfiguredError:
@@ -139,7 +140,7 @@ def _try_postgres_config(
                 "fallback_reason": "tenant_not_configured",
             },
         )
-        return None
+        return None, "tenant_not_configured"
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "tenant.resolve.error",
@@ -149,15 +150,21 @@ def _try_postgres_config(
                 "error_type": type(exc).__name__,
             },
         )
-        return None
+        return None, "postgres_error"
 
     tenant = resolved["tenant"]
     tenant_config = resolved["config"]
     tenant_id = str(tenant["id"])
-    merged = _merge_config(json_config, _normalize_tenant_config(tenant_config))
+    merged = _merge_config({}, _normalize_tenant_config(tenant_config))
     merged["_tenant_id"] = tenant_id
+    merged["_tenant_name"] = tenant.get("name")
+    merged["_tenant_slug"] = tenant.get("slug")
     merged["_config_source"] = "postgres"
     merged["_did"] = did
+    if tenant.get("name"):
+        merged["business_name"] = tenant["name"]
+    if tenant.get("phone_number"):
+        merged["business_phone"] = tenant["phone_number"]
 
     logger.info(
         "config.source.selected",
@@ -173,7 +180,7 @@ def _try_postgres_config(
         source="postgres",
         tenant_id=tenant_id,
         did=did,
-    )
+    ), None
 
 
 def _load_json_config(phone_number: Optional[str]) -> tuple[dict[str, Any], str]:

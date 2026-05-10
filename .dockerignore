@@ -14,6 +14,10 @@ venv/
 env/
 .env
 .env.*
+config.json
+configs/
+google_creds.json
+supabase_*.sql
 *.log
 ui_server.log
 node_modules/

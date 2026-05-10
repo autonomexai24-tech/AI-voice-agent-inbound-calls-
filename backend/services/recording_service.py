@@ -1,118 +1,182 @@
-"""Call recording metadata facade (Phase 2 scaffolding).
-
-Per ARCHITECTURE.md §10, recordings are uploaded asynchronously to
-S3-compatible storage post-call. Metadata lives in the `call_recordings`
-PostgreSQL table.
-
-Phase 2 scope: metadata-layer facade only. Actual upload integration
-(LiveKit Egress → S3-compatible storage) is Phase 6. The current agent.py
-still writes recordings to Supabase S3 directly; that code is NOT touched
-in Phase 2.
-
-Design:
-  * StorageReference — generic, vendor-neutral handle.
-  * RecordingService — record new metadata, list per tenant.
-  * Uploader (Protocol) — future provider interface; not required yet.
-"""
-
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Optional
 from uuid import UUID
 
-from backend.db.connection import get_connection
+from backend.db.connection import is_postgres_enabled
+from backend.integrations.storage import S3StorageProvider, cleanup_local_file
 from backend.utils.logging import get_logger
 
 logger = get_logger("backend.services.recording")
 
 
 @dataclass(frozen=True)
-class StorageReference:
-    """Abstract reference to a stored recording object.
-
-    `storage_key` is opaque to callers; its meaning depends on the
-    provider (e.g. S3 object key, MinIO path). Never a secret on its own.
-    """
-
+class RecordingMetadata:
+    id: UUID
     storage_key: str
-    size_bytes: Optional[int] = None
-    duration_seconds: Optional[int] = None
-
-
-class Uploader(Protocol):
-    """Future interface for S3-compatible uploaders. Not required in Phase 2."""
-
-    name: str
-
-    async def upload(self, local_path: str, object_key: str) -> StorageReference: ...
+    upload_status: str
 
 
 class RecordingService:
-    """Persists call recording metadata. Upload logic is Phase 6."""
+    def __init__(self, storage: Optional[S3StorageProvider] = None) -> None:
+        self.storage = storage or S3StorageProvider()
 
-    def record_metadata(
+    async def record_livekit_upload(
         self,
-        tenant_id: UUID,
-        call_log_id: Optional[UUID],
-        reference: StorageReference,
-    ) -> UUID:
-        """Insert a call_recordings row. Returns the new id."""
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO call_recordings (
-                        tenant_id, call_log_id, storage_key,
-                        duration_seconds, size_bytes
+        *,
+        tenant_id: Optional[str | UUID],
+        call_log_id: Optional[str | UUID],
+        call_id: str,
+        storage_key: str,
+        duration_seconds: Optional[int],
+        file_size: Optional[int],
+        upload_status: str,
+    ) -> Optional[RecordingMetadata]:
+        tenant_uuid = _coerce_uuid(tenant_id)
+        call_log_uuid = _coerce_uuid(call_log_id)
+        if not tenant_uuid or not is_postgres_enabled():
+            logger.info(
+                "recording.metadata.skipped",
+                extra={"tenant_id": str(tenant_id or ""), "call_id": call_id, "reason": "postgres_disabled_or_no_tenant"},
+            )
+            return None
+
+        try:
+            object_url = self.storage.object_url(storage_key) if self.storage.configured else None
+            from backend.db.recordings import insert_recording
+
+            recording_id = await asyncio.to_thread(
+                insert_recording,
+                tenant_id=tenant_uuid,
+                call_log_id=call_log_uuid,
+                call_id=call_id,
+                storage_key=storage_key,
+                recording_url=object_url,
+                duration_seconds=duration_seconds,
+                file_size=file_size,
+                upload_status=upload_status,
+            )
+            logger.info(
+                "recording.metadata.saved",
+                extra={
+                    "tenant_id": str(tenant_uuid),
+                    "call_id": call_id,
+                    "recording_id": str(recording_id),
+                    "upload_status": upload_status,
+                },
+            )
+            return RecordingMetadata(id=recording_id, storage_key=storage_key, upload_status=upload_status)
+        except Exception as exc:
+            logger.warning(
+                "recording.metadata.failed",
+                extra={"tenant_id": str(tenant_uuid), "call_id": call_id, "error_type": type(exc).__name__},
+            )
+            return None
+
+    async def upload_local_recording(
+        self,
+        *,
+        tenant_id: Optional[str | UUID],
+        call_log_id: Optional[str | UUID],
+        call_id: str,
+        local_path: str,
+        storage_key: str,
+        duration_seconds: Optional[int],
+        cleanup_on_success: bool = True,
+    ) -> Optional[RecordingMetadata]:
+        tenant_uuid = _coerce_uuid(tenant_id)
+        call_log_uuid = _coerce_uuid(call_log_id)
+        if not tenant_uuid or not is_postgres_enabled():
+            logger.info(
+                "recording.local_upload.skipped",
+                extra={"tenant_id": str(tenant_id or ""), "call_id": call_id, "reason": "postgres_disabled_or_no_tenant"},
+            )
+            return None
+
+        recording_id = None
+        try:
+            from backend.db.recordings import insert_recording, update_recording_status
+
+            recording_id = await asyncio.to_thread(
+                insert_recording,
+                tenant_id=tenant_uuid,
+                call_log_id=call_log_uuid,
+                call_id=call_id,
+                storage_key=storage_key,
+                recording_url=self.storage.object_url(storage_key) if self.storage.configured else None,
+                duration_seconds=duration_seconds,
+                file_size=None,
+                upload_status="pending",
+            )
+            result = await self.storage.upload_file(local_path=local_path, storage_key=storage_key, retries=1)
+            await asyncio.to_thread(
+                update_recording_status,
+                tenant_id=tenant_uuid,
+                recording_id=recording_id,
+                upload_status=result.status,
+                file_size=result.file_size,
+                recording_url=self.storage.object_url(storage_key) if result.status == "uploaded" else None,
+            )
+            if result.status == "uploaded" and cleanup_on_success:
+                cleanup_local_file(local_path)
+            return RecordingMetadata(id=recording_id, storage_key=storage_key, upload_status=result.status)
+        except Exception as exc:
+            logger.warning(
+                "recording.local_upload.failed",
+                extra={"tenant_id": str(tenant_uuid), "call_id": call_id, "error_type": type(exc).__name__},
+            )
+            if recording_id:
+                try:
+                    from backend.db.recordings import update_recording_status
+
+                    await asyncio.to_thread(
+                        update_recording_status,
+                        tenant_id=tenant_uuid,
+                        recording_id=recording_id,
+                        upload_status="failed",
                     )
-                    VALUES (%s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        str(tenant_id),
-                        str(call_log_id) if call_log_id else None,
-                        reference.storage_key,
-                        reference.duration_seconds,
-                        reference.size_bytes,
-                    ),
-                )
-                (new_id,) = cur.fetchone()
+                except Exception:
+                    pass
+            return None
 
-        logger.info(
-            "recording.metadata.saved",
-            extra={
-                "tenant_id": str(tenant_id),
-                "recording_id": str(new_id),
-                "has_call_log": call_log_id is not None,
-            },
-        )
-        return new_id
+    async def signed_playback_url(
+        self,
+        *,
+        tenant_id: UUID,
+        recording_id: UUID,
+        expires_seconds: int = 3600,
+    ) -> Optional[str]:
+        try:
+            from backend.db.recordings import get_recording
 
-    def list_for_tenant(self, tenant_id: UUID, limit: int = 200) -> list[dict]:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, tenant_id, call_log_id, storage_key,
-                           duration_seconds, size_bytes, created_at
-                    FROM call_recordings
-                    WHERE tenant_id = %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
-                    (str(tenant_id), limit),
-                )
-                rows = cur.fetchall()
-        return [
-            {
-                "id": r[0],
-                "tenant_id": r[1],
-                "call_log_id": r[2],
-                "storage_key": r[3],
-                "duration_seconds": r[4],
-                "size_bytes": r[5],
-                "created_at": r[6],
-            }
-            for r in rows
-        ]
+            row = await asyncio.to_thread(get_recording, tenant_id=tenant_id, recording_id=recording_id)
+            if not row or row.get("upload_status") != "uploaded":
+                return None
+            return self.storage.generate_signed_url(row["storage_key"], expires_seconds=expires_seconds)
+        except Exception as exc:
+            logger.warning(
+                "recording.signed_url.failed",
+                extra={"tenant_id": str(tenant_id), "recording_id": str(recording_id), "error_type": type(exc).__name__},
+            )
+            return None
+
+
+async def record_livekit_upload_metadata(**kwargs) -> Optional[RecordingMetadata]:
+    try:
+        return await RecordingService().record_livekit_upload(**kwargs)
+    except Exception as exc:
+        logger.warning("recording.safe_failure", extra={"call_id": kwargs.get("call_id"), "error_type": type(exc).__name__})
+        return None
+
+
+def _coerce_uuid(value: Optional[str | UUID]) -> Optional[UUID]:
+    if isinstance(value, UUID):
+        return value
+    if not value:
+        return None
+    try:
+        return UUID(str(value))
+    except ValueError:
+        return None

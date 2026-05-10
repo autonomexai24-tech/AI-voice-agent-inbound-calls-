@@ -88,6 +88,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </nav>
         <div className="hidden border-t border-line p-5 lg:absolute lg:bottom-0 lg:left-0 lg:right-0 lg:block">
           <div className="truncate text-sm font-semibold text-ink">{user?.tenant_name || "Tenant"}</div>
+          {user?.tenant_phone ? <div className="mt-1 truncate text-xs text-slate-500">{user.tenant_phone}</div> : null}
           <div className="mt-1 truncate text-xs text-slate-500">{user?.email}</div>
           <button
             type="button"
@@ -104,6 +105,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <div className="min-w-0">
               <div className="text-xs font-semibold uppercase text-slate-500">Tenant</div>
               <div className="truncate text-sm font-semibold text-ink">{user?.tenant_name}</div>
+              {user?.tenant_phone ? <div className="truncate text-xs text-slate-500">{user.tenant_phone}</div> : null}
             </div>
             <button
               type="button"

@@ -65,9 +65,25 @@ def fetch_call_logs(tenant_id: UUID, limit: int = 50, offset: int = 0) -> list[d
                 """
                 SELECT
                     id, tenant_id, phone_number, duration_seconds,
-                    transcript, summary, sentiment, created_at
-                FROM call_logs
-                WHERE tenant_id = %s
+                    transcript, summary, sentiment, created_at,
+                    recording_id, recording_upload_status
+                FROM (
+                    SELECT
+                        cl.id, cl.tenant_id, cl.phone_number, cl.duration_seconds,
+                        cl.transcript, cl.summary, cl.sentiment, cl.created_at,
+                        cr.id AS recording_id,
+                        cr.upload_status AS recording_upload_status
+                    FROM call_logs cl
+                    LEFT JOIN LATERAL (
+                        SELECT id, upload_status
+                        FROM call_recordings
+                        WHERE tenant_id = cl.tenant_id
+                          AND call_log_id = cl.id
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    ) cr ON TRUE
+                    WHERE cl.tenant_id = %s
+                ) rows
                 ORDER BY created_at DESC
                 LIMIT %s OFFSET %s
                 """,
@@ -84,6 +100,8 @@ def fetch_call_logs(tenant_id: UUID, limit: int = 50, offset: int = 0) -> list[d
                     "summary": r[5],
                     "sentiment": r[6],
                     "created_at": r[7],
+                    "recording_id": r[8],
+                    "recording_upload_status": r[9],
                 }
                 for r in rows
             ]
@@ -115,6 +133,32 @@ def get_call_log(tenant_id: UUID, call_log_id: UUID) -> Optional[dict]:
                 "summary": row[5],
                 "sentiment": row[6],
                 "created_at": row[7],
+            }
+
+
+def get_latest_call_for_phone(tenant_id: UUID, phone_number: str) -> Optional[dict]:
+    """Return the latest call for a caller within one tenant only."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, tenant_id, phone_number, summary, created_at
+                FROM call_logs
+                WHERE tenant_id = %s AND phone_number = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (str(tenant_id), phone_number),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return {
+                "id": row[0],
+                "tenant_id": row[1],
+                "phone_number": row[2],
+                "summary": row[3],
+                "created_at": row[4],
             }
 
 

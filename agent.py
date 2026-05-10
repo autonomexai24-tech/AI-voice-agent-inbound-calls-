@@ -1,30 +1,14 @@
 import os
 import json
 import logging
-import certifi
 import pytz
 import re
 import asyncio
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 from typing import Annotated
-
-# Fix for macOS SSL certificate verification
-os.environ["SSL_CERT_FILE"] = certifi.where()
-
-# ── Sentry error tracking (#21) ───────────────────────────────────────────────
-import sentry_sdk
-_sentry_dsn = os.environ.get("SENTRY_DSN", "")
-if _sentry_dsn:
-    from sentry_sdk.integrations.asyncio import AsyncioIntegration
-    sentry_sdk.init(
-        dsn=_sentry_dsn,
-        traces_sample_rate=0.1,
-        integrations=[AsyncioIntegration()],
-        environment=os.environ.get("ENVIRONMENT", "production"),
-    )
+from dotenv import load_dotenv
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 logging.getLogger("hpack").setLevel(logging.WARNING)
@@ -32,8 +16,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 load_dotenv()
-logger = logging.getLogger("outbound-agent")
-logging.basicConfig(level=logging.INFO)
+from backend.logging import configure_logging, get_logger, init_sentry, set_correlation_context
+
+configure_logging("voice-agent")
+init_sentry("voice-agent")
+logger = get_logger("voice-agent")
 
 from livekit import api
 from livekit.agents import (
@@ -83,7 +70,7 @@ def get_live_config(phone_number: str | None = None):
                     logger.info(f"[CONFIG] Loaded: {path}")
                     break
             except Exception as e:
-                logger.error(f"[CONFIG] Failed to read {path}: {e}")
+                logger.error("[CONFIG] Failed to read", extra={"path": path, "error_type": type(e).__name__})
 
     return {
         "agent_instructions":       config.get("agent_instructions", ""),
@@ -113,12 +100,6 @@ def count_tokens(text: str) -> int:
 
 # ── External imports ───────────────────────────────────────────────────────────
 from calendar_tools import get_available_slots, create_booking, cancel_booking
-from notify import (
-    notify_booking_confirmed,
-    notify_booking_cancelled,
-    notify_call_no_booking,
-    notify_agent_error,
-)
 
 # Phase 3A: pure helpers now live in backend/voice/. Behavior is byte-identical
 # to the previous inline definitions; see docs/PHASE3A_REPORT.md.
@@ -129,6 +110,9 @@ from backend.core.config_resolver import resolve_runtime_config
 from backend.core.startup import run_startup_checks
 from backend.db.call_logs import insert_call_log
 from backend.db.connection import is_postgres_enabled
+from backend.integrations.storage import S3StorageProvider, build_recording_storage_key
+from backend.services.notification_service import send_booking_confirmation_sms
+from backend.services.recording_service import record_livekit_upload_metadata
 from backend.utils.formatting import mask_phone
 
 
@@ -138,21 +122,46 @@ from backend.utils.formatting import mask_phone
 
 class AgentTools(llm.ToolContext):
 
-    def __init__(self, caller_phone: str, caller_name: str = ""):
+    def __init__(
+        self,
+        caller_phone: str,
+        caller_name: str = "",
+        *,
+        transfer_number: str | None = None,
+        sip_domain: str | None = None,
+        cal_api_key: str | None = None,
+        cal_event_type_id: str | int | None = None,
+        business_hours: dict | None = None,
+        call_id: str | None = None,
+        tenant_id: str | None = None,
+        did: str | None = None,
+    ):
         super().__init__(tools=[])
         self.caller_phone        = caller_phone
         self.caller_name         = caller_name
         self.booking_intent: dict | None = None
-        self.sip_domain          = os.getenv("VOBIZ_SIP_DOMAIN")
+        self.sip_domain          = sip_domain or os.getenv("VOBIZ_SIP_DOMAIN")
+        self.transfer_number     = transfer_number or os.getenv("DEFAULT_TRANSFER_NUMBER")
+        self.cal_api_key         = cal_api_key
+        self.cal_event_type_id   = cal_event_type_id
+        self.business_hours      = business_hours if isinstance(business_hours, dict) else None
+        self.call_id             = call_id
+        self.tenant_id           = tenant_id
+        self.did_masked          = mask_phone(did) if did else None
         self.ctx_api             = None
         self.room_name           = None
         self._sip_identity       = None
 
+    def _log_extra(self, **extra):
+        base = {"call_id": self.call_id, "tenant_id": self.tenant_id, "did": self.did_masked}
+        base.update(extra)
+        return {k: v for k, v in base.items() if v is not None}
+
     # ── Tool: Transfer to Human ───────────────────────────────────────────
     @llm.function_tool(description="Transfer this call to a human agent. Use if: caller asks for human, is angry, or query is outside scope.")
     async def transfer_call(self) -> str:
-        logger.info("[TOOL] transfer_call triggered")
-        destination = build_sip_transfer_uri(os.getenv("DEFAULT_TRANSFER_NUMBER"), self.sip_domain)
+        logger.info("[TOOL] transfer_call triggered", extra=self._log_extra())
+        destination = build_sip_transfer_uri(self.transfer_number, self.sip_domain)
         try:
             if self.ctx_api and self.room_name and destination and self._sip_identity:
                 await self.ctx_api.sip.transfer_sip_participant(
@@ -163,16 +172,18 @@ class AgentTools(llm.ToolContext):
                         play_dialtone=False,
                     )
                 )
+                logger.info("[TOOL] transfer_call completed", extra=self._log_extra())
                 return "Transfer initiated successfully."
+            logger.warning("[TOOL] transfer_call unavailable", extra=self._log_extra(has_destination=bool(destination)))
             return "Unable to transfer right now."
         except Exception as e:
-            logger.error(f"Transfer failed: {e}")
+            logger.error("[TOOL] transfer_call failed", extra=self._log_extra(error_type=type(e).__name__))
             return "Unable to transfer right now."
 
     # ── Tool: End Call ────────────────────────────────────────────────────
     @llm.function_tool(description="End the call. Use ONLY when caller says bye/goodbye or after booking is fully confirmed.")
     async def end_call(self) -> str:
-        logger.info("[TOOL] end_call triggered — hanging up.")
+        logger.info("[TOOL] end_call triggered", extra=self._log_extra())
         try:
             if self.ctx_api and self.room_name and self._sip_identity:
                 await self.ctx_api.sip.transfer_sip_participant(
@@ -184,7 +195,7 @@ class AgentTools(llm.ToolContext):
                     )
                 )
         except Exception as e:
-            logger.warning(f"[END-CALL] SIP hangup failed: {e}")
+            logger.warning("[END-CALL] SIP hangup failed", extra=self._log_extra(error_type=type(e).__name__))
         return "Call ended."
 
     # ── Tool: Save Booking Intent ─────────────────────────────────────────
@@ -199,6 +210,7 @@ class AgentTools(llm.ToolContext):
         logger.info(
             "[TOOL] save_booking_intent",
             extra={
+                **self._log_extra(),
                 "caller_phone_masked": mask_phone(caller_phone),
                 "has_caller_name": bool(caller_name),
                 "start_time_present": bool(start_time),
@@ -214,7 +226,7 @@ class AgentTools(llm.ToolContext):
             self.caller_name = caller_name
             return f"Booking intent saved for {caller_name} at {start_time}. I'll confirm after the call."
         except Exception as e:
-            logger.error(f"[TOOL] save_booking_intent failed: {e}")
+            logger.error("[TOOL] save_booking_intent failed", extra=self._log_extra(error_type=type(e).__name__))
             return "I had trouble saving the booking. Please try again."
 
     # ── Tool: Check Availability (#13) ────────────────────────────────────
@@ -223,15 +235,20 @@ class AgentTools(llm.ToolContext):
         self,
         date: Annotated[str, "Date to check in YYYY-MM-DD format e.g. '2026-03-01'"],
     ) -> str:
-        logger.info(f"[TOOL] check_availability: date={date}")
+        logger.info("[TOOL] check_availability", extra=self._log_extra(date=date))
         try:
-            slots = await get_available_slots(date)
+            slots = await asyncio.to_thread(
+                get_available_slots,
+                date,
+                cal_api_key=self.cal_api_key,
+                cal_event_type_id=self.cal_event_type_id,
+            )
             if not slots:
                 return f"No available slots on {date}. Would you like to check another date?"
             slot_strings = [s.get("start_time", str(s))[-8:][:5] for s in slots[:6]]
             return f"Available slots on {date}: {', '.join(slot_strings)} IST."
         except Exception as e:
-            logger.error(f"[TOOL] check_availability failed: {e}")
+            logger.error("[TOOL] check_availability failed", extra=self._log_extra(error_type=type(e).__name__))
             return "I'm having trouble checking the calendar right now."
 
     # ── Tool: Business Hours (#31) ────────────────────────────────────────
@@ -239,6 +256,10 @@ class AgentTools(llm.ToolContext):
     async def get_business_hours(self) -> str:
         ist  = pytz.timezone("Asia/Kolkata")
         now  = datetime.now(ist)
+        configured = self._configured_business_hours(now)
+        if configured:
+            return configured
+
         hours = {
             0: ("Monday",    "10:00", "19:00"),
             1: ("Tuesday",   "10:00", "19:00"),
@@ -256,15 +277,34 @@ class AgentTools(llm.ToolContext):
             return f"We are OPEN. Today ({day_name}): {open_t}–{close_t} IST."
         return f"We are CLOSED. Today ({day_name}): {open_t}–{close_t} IST."
 
+    def _configured_business_hours(self, now: datetime) -> str | None:
+        if not self.business_hours:
+            return None
+        day_key = now.strftime("%A").lower()
+        day_config = self.business_hours.get(day_key) or self.business_hours.get(day_key[:3])
+        if not isinstance(day_config, dict):
+            return None
+        if day_config.get("closed") is True:
+            return f"We are CLOSED today ({now.strftime('%A')})."
+        open_t = day_config.get("open") or day_config.get("start")
+        close_t = day_config.get("close") or day_config.get("end")
+        if not open_t or not close_t:
+            return None
+        current_time = now.strftime("%H:%M")
+        if str(open_t) <= current_time <= str(close_t):
+            return f"We are OPEN. Today ({now.strftime('%A')}): {open_t}-{close_t} IST."
+        return f"We are CLOSED. Today ({now.strftime('%A')}): {open_t}-{close_t} IST."
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AGENT CLASS
 # ══════════════════════════════════════════════════════════════════════════════
 
-class OutboundAssistant(Agent):
+class ReceptionistAssistant(Agent):
 
     def __init__(self, agent_tools: AgentTools, first_line: str = "", live_config: dict | None = None):
         tools = llm.find_function_tools(agent_tools)
+        self._agent_tools = agent_tools
         self._first_line  = first_line
         self._live_config = live_config or {}
         live_config_loaded = self._live_config
@@ -287,13 +327,18 @@ class OutboundAssistant(Agent):
         greeting = self._live_config.get(
             "first_line",
             self._first_line or (
-                "Namaste! This is Aryan from RapidX AI — we help businesses automate with AI. "
-                "Hmm, may I ask what kind of business you run?"
+                "Namaste, thanks for calling. How can I help you today?"
             )
         )
         await self.session.generate_reply(
             instructions=f"Say exactly this phrase: '{greeting}'"
         )
+        if self._live_config.get("_terminate_after_first_line"):
+            asyncio.create_task(self._end_after_first_line())
+
+    async def _end_after_first_line(self):
+        await asyncio.sleep(4)
+        await self._agent_tools.end_call()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -308,6 +353,7 @@ async def entrypoint(ctx: JobContext):
     # ── Connect ───────────────────────────────────────────────────────────
     await ctx.connect()
     call_id = ctx.room.name
+    set_correlation_context(call_id=call_id)
     logger.info("[ROOM] Connected", extra={"call_id": call_id})
 
     # ── Extract caller info ───────────────────────────────────────────────
@@ -315,7 +361,7 @@ async def entrypoint(ctx: JobContext):
     caller_name  = ""
     caller_phone = "unknown"
 
-    # Try metadata first (outbound dispatch)
+    # Try metadata first (LiveKit dispatch metadata)
     metadata = ctx.job.metadata or ""
     meta = {}
     if metadata:
@@ -360,11 +406,37 @@ async def entrypoint(ctx: JobContext):
     resolved_config = resolve_runtime_config(caller_phone=caller_phone, did=dialed_did)
     live_config   = resolved_config.config
     tenant_id     = resolved_config.tenant_id
+    did_masked    = mask_phone(dialed_did) if dialed_did else None
+    set_correlation_context(call_id=call_id, tenant_id=str(tenant_id or ""), did=did_masked or "")
+    tenant_config_unavailable = (
+        is_postgres_enabled()
+        and not tenant_id
+        and resolved_config.fallback_reason
+        in {"tenant_not_configured", "postgres_error", "did_missing", "postgres_unavailable_or_unconfigured"}
+    )
+    postgres_tenant_runtime = is_postgres_enabled() and (bool(tenant_id) or tenant_config_unavailable)
+    if tenant_config_unavailable:
+        if resolved_config.fallback_reason == "tenant_not_configured":
+            fallback_line = "This number is not configured. Please contact support."
+        else:
+            fallback_line = "We are unable to load this number's configuration right now. Please call again later."
+        live_config["agent_instructions"] = (
+            "This inbound call cannot be mapped to an active tenant configuration. "
+            "Do not answer business questions. Say the configured fallback message once and end the call."
+        )
+        live_config["first_line"] = fallback_line
+        live_config["_terminate_after_first_line"] = True
+        live_config["max_turns"] = 1
+        logger.warning(
+            "tenant.config.unavailable",
+            extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked},
+        )
     logger.info(
         "config.runtime.selected",
         extra={
             "call_id": call_id,
             "tenant_id": tenant_id,
+            "did": did_masked,
             "config_source": resolved_config.source,
             "fallback_reason": resolved_config.fallback_reason,
         },
@@ -379,32 +451,31 @@ async def entrypoint(ctx: JobContext):
     stt_language  = live_config.get("stt_language", "unknown")  # auto-detect (#20)
     max_turns     = live_config.get("max_turns", 25)
 
-    # Override OS env vars from UI config
-    for key in ["LIVEKIT_URL","LIVEKIT_API_KEY","LIVEKIT_API_SECRET","OPENAI_API_KEY",
-                "SARVAM_API_KEY","CAL_API_KEY","TELEGRAM_BOT_TOKEN","SUPABASE_URL","SUPABASE_KEY"]:
-        val = live_config.get(key.lower(), "")
-        if val:
-            os.environ[key] = val
-
     # ── Caller memory (#15) ───────────────────────────────────────────────
     async def get_caller_history(phone: str) -> str:
+        if tenant_config_unavailable:
+            return ""
         if phone == "unknown":
             return ""
-        try:
-            sb = db.get_supabase()
-            if not sb:
+        if tenant_id and is_postgres_enabled():
+            try:
+                from uuid import UUID as _UUID
+                from backend.db.call_logs import get_latest_call_for_phone
+
+                last = await asyncio.to_thread(
+                    get_latest_call_for_phone,
+                    _UUID(str(tenant_id)),
+                    phone,
+                )
+                if last:
+                    created_at = str(last.get("created_at") or "")[:10]
+                    return f"\n\n[CALLER HISTORY: Last call {created_at}. Summary: {last.get('summary') or ''}]"
+            except Exception as e:
+                logger.warning(
+                    "[MEMORY] Could not load tenant caller history",
+                    extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "error_type": type(e).__name__},
+                )
                 return ""
-            result = (sb.table("call_logs")
-                        .select("summary, created_at")
-                        .eq("phone_number", phone)
-                        .order("created_at", desc=True)
-                        .limit(1)
-                        .execute())
-            if result.data:
-                last = result.data[0]
-                return f"\n\n[CALLER HISTORY: Last call {last['created_at'][:10]}. Summary: {last['summary']}]"
-        except Exception as e:
-            logger.warning(f"[MEMORY] Could not load history: {e}")
         return ""
 
     caller_history = await get_caller_history(caller_phone)
@@ -417,7 +488,18 @@ async def entrypoint(ctx: JobContext):
         live_config["agent_instructions"] = (live_config.get("agent_instructions","") + caller_history)
 
     # ── Instantiate tools ─────────────────────────────────────────────────
-    agent_tools = AgentTools(caller_phone=caller_phone, caller_name=caller_name)
+    agent_tools = AgentTools(
+        caller_phone=caller_phone,
+        caller_name=caller_name,
+        transfer_number=live_config.get("transfer_number") or os.getenv("DEFAULT_TRANSFER_NUMBER"),
+        sip_domain=os.getenv("VOBIZ_SIP_DOMAIN"),
+        cal_api_key=live_config.get("cal_api_key"),
+        cal_event_type_id=live_config.get("cal_event_type_id"),
+        business_hours=_coerce_business_hours(live_config.get("business_hours_json")),
+        call_id=call_id,
+        tenant_id=tenant_id,
+        did=dialed_did,
+    )
     agent_tools._sip_identity = (
         f"sip_{caller_phone.replace('+','')}" if phone_number else "inbound_caller"
     )
@@ -512,7 +594,7 @@ async def entrypoint(ctx: JobContext):
     last_user_speech_at: float | None = None
 
     # ── Build agent ───────────────────────────────────────────────────────
-    agent = OutboundAssistant(
+    agent = ReceptionistAssistant(
         agent_tools=agent_tools,
         first_line=live_config.get("first_line", ""),
         live_config=live_config,
@@ -552,12 +634,24 @@ async def entrypoint(ctx: JobContext):
     except Exception as e:
         logger.debug(f"[TTS] Pre-warm skipped: {e}")
 
-    logger.info("[AGENT] Session live — waiting for caller audio.")
+    logger.info("[AGENT] Session live - waiting for caller audio.", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked})
     call_start_time = datetime.now()
 
-    # ── Recording → Supabase Storage ─────────────────────────────────────
+    # ── Recording → S3-Compatible Storage ────────────────────────────────
     egress_id = None
+    recording_storage_key = build_recording_storage_key(
+        tenant_id=str(tenant_id) if tenant_id else "legacy",
+        call_id=call_id,
+        filename="recording.ogg",
+    )
+    recording_object_url = ""
+    recording_upload_status = "pending"
+    recording_file_size = None
+    recording_duration_seconds = None
     try:
+        storage = S3StorageProvider()
+        if not storage.configured:
+            raise RuntimeError("s3_storage_not_configured")
         rec_api = api.LiveKitAPI(
             url=os.environ["LIVEKIT_URL"],
             api_key=os.environ["LIVEKIT_API_KEY"],
@@ -569,57 +663,34 @@ async def entrypoint(ctx: JobContext):
                 audio_only=True,
                 file_outputs=[api.EncodedFileOutput(
                     file_type=api.EncodedFileType.OGG,
-                    filepath=f"recordings/{ctx.room.name}.ogg",
-                    s3=api.S3Upload(
-                        access_key=os.environ["SUPABASE_S3_ACCESS_KEY"],
-                        secret=os.environ["SUPABASE_S3_SECRET_KEY"],
-                        bucket="call-recordings",
-                        region=os.environ.get("SUPABASE_S3_REGION", "ap-south-1"),
-                        endpoint=os.environ["SUPABASE_S3_ENDPOINT"],
-                        force_path_style=True,
-                    )
+                    filepath=recording_storage_key,
+                    s3=api.S3Upload(**storage.livekit_s3_config())
                 )]
             )
         )
         egress_id = egress_resp.egress_id
+        recording_object_url = storage.object_url(recording_storage_key)
         await rec_api.aclose()
-        logger.info(f"[RECORDING] Started egress: {egress_id}")
+        logger.info(
+            "recording.egress.started",
+            extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "egress_id": egress_id},
+        )
     except Exception as e:
-        logger.warning(f"[RECORDING] Failed to start recording: {e}")
+        recording_upload_status = "failed"
+        logger.warning(
+            "recording.egress.start_failed",
+            extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "error_type": type(e).__name__},
+        )
 
     # ── Upsert active_calls (#38) ─────────────────────────────────────────
     async def upsert_active_call(status: str):
-        try:
-            sb = db.get_supabase()
-            if sb:
-                sb.table("active_calls").upsert({
-                    "room_id":     ctx.room.name,
-                    "phone":       caller_phone,
-                    "caller_name": caller_name,
-                    "status":      status,
-                    "last_updated": datetime.utcnow().isoformat(),
-                }).execute()
-        except Exception as e:
-            logger.debug(f"[ACTIVE-CALL] {e}")
+        return
 
     await upsert_active_call("active")
 
     # ── Real-time transcript streaming (#33) ─────────────────────────────
     async def _log_transcript(role: str, content: str):
-        try:
-            sb = db.get_supabase()
-            if sb:
-                sb.table("call_transcripts").insert({
-                    "call_room_id": ctx.room.name,
-                    "phone":        caller_phone,
-                    "role":         role,
-                    "content":      content,
-                }).execute()
-        except Exception as e:
-            logger.debug(
-                "[TRANSCRIPT-STREAM] write failed",
-                extra={"call_id": call_id, "error_type": type(e).__name__},
-            )
+        return
 
     # ── Session event handlers ────────────────────────────────────────────
     @session.on("agent_speech_started")
@@ -633,6 +704,7 @@ async def entrypoint(ctx: JobContext):
                 extra={
                     "call_id": call_id,
                     "tenant_id": tenant_id,
+                    "did": did_masked,
                     "latency_ms": round((time.perf_counter() - last_user_speech_at) * 1000, 2),
                 },
             )
@@ -650,7 +722,7 @@ async def entrypoint(ctx: JobContext):
         interrupt_count += 1
         logger.info(
             "[INTERRUPT] Agent interrupted",
-            extra={"call_id": call_id, "tenant_id": tenant_id, "interrupt_count": interrupt_count},
+            extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "interrupt_count": interrupt_count},
         )
 
     @session.on("user_input_transcribed")
@@ -661,6 +733,7 @@ async def entrypoint(ctx: JobContext):
                 extra={
                     "call_id": call_id,
                     "tenant_id": tenant_id,
+                    "did": did_masked,
                     "stt_received_at": getattr(ev, "created_at", None),
                     "language": getattr(ev, "language", None),
                 },
@@ -678,6 +751,7 @@ async def entrypoint(ctx: JobContext):
                 extra={
                     "call_id": call_id,
                     "tenant_id": tenant_id,
+                    "did": did_masked,
                     "duration_ms": round(getattr(metrics, "duration", 0.0) * 1000, 2),
                     "audio_duration_ms": round(getattr(metrics, "audio_duration", 0.0) * 1000, 2),
                     "streamed": getattr(metrics, "streamed", None),
@@ -689,6 +763,7 @@ async def entrypoint(ctx: JobContext):
                 extra={
                     "call_id": call_id,
                     "tenant_id": tenant_id,
+                    "did": did_masked,
                     "ttft_ms": round(getattr(metrics, "ttft", 0.0) * 1000, 2),
                     "duration_ms": round(getattr(metrics, "duration", 0.0) * 1000, 2),
                     "cancelled": getattr(metrics, "cancelled", None),
@@ -700,6 +775,7 @@ async def entrypoint(ctx: JobContext):
                 extra={
                     "call_id": call_id,
                     "tenant_id": tenant_id,
+                    "did": did_masked,
                     "ttfb_ms": round(getattr(metrics, "ttfb", 0.0) * 1000, 2),
                     "duration_ms": round(getattr(metrics, "duration", 0.0) * 1000, 2),
                     "audio_duration_ms": round(getattr(metrics, "audio_duration", 0.0) * 1000, 2),
@@ -723,12 +799,12 @@ async def entrypoint(ctx: JobContext):
         transcript_lower = transcript.lower().rstrip(".")
 
         if agent_is_speaking:
-            logger.debug("[FILTER-ECHO] Dropped transcript echo", extra={"call_id": call_id})
+            logger.debug("[FILTER-ECHO] Dropped transcript echo", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked})
             return
         if not transcript or len(transcript) < 3:
             return
         if transcript_lower in FILLER_WORDS:
-            logger.debug("[FILTER-FILLER] Dropped filler transcript", extra={"call_id": call_id})
+            logger.debug("[FILTER-FILLER] Dropped filler transcript", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked})
             return
 
         # Real-time transcript stream
@@ -742,6 +818,7 @@ async def entrypoint(ctx: JobContext):
             extra={
                 "call_id": call_id,
                 "tenant_id": tenant_id,
+                "did": did_masked,
                 "turn_count": turn_count,
                 "max_turns": max_turns,
                 "transcript_chars": len(transcript),
@@ -758,7 +835,7 @@ async def entrypoint(ctx: JobContext):
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant):
         global agent_is_speaking
-        logger.info("[HANGUP] Participant disconnected", extra={"call_id": call_id})
+        logger.info("[HANGUP] Participant disconnected", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked})
         agent_is_speaking = False
         asyncio.create_task(unified_shutdown_hook(ctx))
 
@@ -767,12 +844,14 @@ async def entrypoint(ctx: JobContext):
     # ══════════════════════════════════════════════════════════════════════
 
     async def unified_shutdown_hook(shutdown_ctx: JobContext):
-        logger.info("[SHUTDOWN] Sequence started.")
+        nonlocal recording_upload_status, recording_file_size, recording_duration_seconds
+        logger.info("[SHUTDOWN] Sequence started.", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked})
 
         duration = int((datetime.now() - call_start_time).total_seconds())
 
         # Booking
         booking_status_msg = "No booking"
+        booking_result = None
         if agent_tools.booking_intent:
             from calendar_tools import async_create_booking
             intent = agent_tools.booking_intent
@@ -781,27 +860,44 @@ async def entrypoint(ctx: JobContext):
                 caller_name=intent["caller_name"] or "Unknown Caller",
                 caller_phone=intent["caller_phone"],
                 notes=intent["notes"],
+                cal_api_key=live_config.get("cal_api_key"),
+                cal_event_type_id=live_config.get("cal_event_type_id"),
             )
+            booking_result = result
             if result.get("success"):
-                notify_booking_confirmed(
+                sms_language = (
+                    live_config.get("detected_language")
+                    or live_config.get("caller_language")
+                    or live_config.get("lang_preset")
+                )
+                if str(sms_language or "").lower() in ("", "auto", "multilingual", "unknown"):
+                    sms_language = stt_language if stt_language != "unknown" else tts_language
+                asyncio.create_task(send_booking_confirmation_sms(
+                    tenant_id=tenant_id,
+                    call_id=call_id,
                     caller_name=intent["caller_name"],
                     caller_phone=intent["caller_phone"],
                     booking_time_iso=intent["start_time"],
-                    booking_id=result.get("booking_id"),
-                    notes=intent["notes"],
-                    tts_voice=tts_voice,
-                    ai_summary="",
+                    business_name=live_config.get("business_name") or live_config.get("_tenant_name") or "RapidX AI",
+                    language=sms_language,
+                    did=did_masked,
+                ))
+                logger.info(
+                    "notification.sms.enqueued",
+                    extra={
+                        "call_id": call_id,
+                        "tenant_id": tenant_id,
+                        "did": did_masked,
+                        "phone_masked": mask_phone(intent["caller_phone"]),
+                    },
                 )
                 booking_status_msg = f"Booking Confirmed: {result.get('booking_id')}"
             else:
                 booking_status_msg = f"Booking Failed: {result.get('message')}"
         else:
-            notify_call_no_booking(
-                caller_name=agent_tools.caller_name,
-                caller_phone=agent_tools.caller_phone,
-                call_summary="Caller did not schedule during this call.",
-                tts_voice=tts_voice,
-                duration_seconds=duration,
+            logger.info(
+                "notification.sms.skipped",
+                extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "reason": "no_booking"},
             )
 
         # Build transcript
@@ -819,7 +915,7 @@ async def entrypoint(ctx: JobContext):
                     lines.append(f"[{msg.role.upper()}] {content}")
             transcript_text = "\n".join(lines)
         except Exception as e:
-            logger.error(f"[SHUTDOWN] Transcript read failed: {e}")
+            logger.error("[SHUTDOWN] Transcript read failed", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "error_type": type(e).__name__})
             transcript_text = "unavailable"
 
         # Sentiment analysis (#14)
@@ -836,7 +932,7 @@ async def entrypoint(ctx: JobContext):
                 sentiment = resp.choices[0].message.content.strip().lower()
                 logger.info(f"[SENTIMENT] {sentiment}")
             except Exception as e:
-                logger.warning(f"[SENTIMENT] Failed: {e}")
+                logger.warning("[SENTIMENT] Failed", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "error_type": type(e).__name__})
 
         # Cost estimation (#34)
         def estimate_cost(dur: int, chars: int) -> float:
@@ -855,7 +951,7 @@ async def entrypoint(ctx: JobContext):
         call_dt = call_start_time.astimezone(ist)
 
         # Stop recording
-        recording_url = ""
+        recording_url = recording_object_url
         if egress_id:
             try:
                 stop_api = api.LiveKitAPI(
@@ -863,21 +959,41 @@ async def entrypoint(ctx: JobContext):
                     api_key=os.environ["LIVEKIT_API_KEY"],
                     api_secret=os.environ["LIVEKIT_API_SECRET"],
                 )
-                await stop_api.egress.stop_egress(api.StopEgressRequest(egress_id=egress_id))
+                egress_info = await stop_api.egress.stop_egress(api.StopEgressRequest(egress_id=egress_id))
                 await stop_api.aclose()
-                recording_url = (
-                    f"{os.environ.get('SUPABASE_URL','')}/storage/v1/object/public/"
-                    f"call-recordings/recordings/{ctx.room.name}.ogg"
+                recording_upload_status = "failed" if getattr(egress_info, "error", "") else "uploaded"
+                file_results = list(getattr(egress_info, "file_results", []) or [])
+                if file_results:
+                    first_file = file_results[0]
+                    recording_file_size = int(getattr(first_file, "size", 0) or 0) or None
+                    duration_ns = int(getattr(first_file, "duration", 0) or 0)
+                    if duration_ns:
+                        recording_duration_seconds = max(1, round(duration_ns / 1_000_000_000))
+                    if getattr(first_file, "location", ""):
+                        recording_url = first_file.location
+                logger.info(
+                    "recording.egress.stopped",
+                    extra={
+                        "call_id": call_id,
+                        "tenant_id": tenant_id,
+                        "did": did_masked,
+                        "egress_id": egress_id,
+                        "upload_status": recording_upload_status,
+                        "file_size": recording_file_size,
+                    },
                 )
-                logger.info("[RECORDING] Stopped", extra={"call_id": call_id})
             except Exception as e:
-                logger.warning(f"[RECORDING] Stop failed: {e}")
+                recording_upload_status = "failed"
+                logger.warning(
+                    "recording.egress.stop_failed",
+                    extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "error_type": type(e).__name__},
+                )
 
         # Update active_calls to completed (#38)
         await upsert_active_call("completed")
 
         # n8n webhook (#39)
-        _n8n_url = os.getenv("N8N_WEBHOOK_URL")
+        _n8n_url = live_config.get("n8n_webhook_url") or (None if postgres_tenant_runtime else os.getenv("N8N_WEBHOOK_URL"))
         if _n8n_url:
             try:
                 import httpx
@@ -897,29 +1013,31 @@ async def entrypoint(ctx: JobContext):
                 )
                 logger.info("[N8N] Webhook triggered")
             except Exception as e:
-                logger.warning(f"[N8N] Webhook failed: {e}")
+                logger.warning("[N8N] Webhook failed", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "error_type": type(e).__name__})
 
-        # Save to Supabase
-        from db import save_call_log
-        save_call_log(
-            phone=caller_phone,
-            duration=duration,
-            transcript=transcript_text,
-            summary=booking_status_msg,
-            recording_url=recording_url,
-            caller_name=agent_tools.caller_name or "",
-            sentiment=sentiment,
-            estimated_cost_usd=estimated_cost,
-            call_date=call_dt.date().isoformat(),
-            call_hour=call_dt.hour,
-            call_day_of_week=call_dt.strftime("%A"),
-            was_booked=bool(agent_tools.booking_intent),
-            interrupt_count=interrupt_count,
-        )
+        # Legacy fallback is intentionally disabled; PostgreSQL is the production path.
+        if not postgres_tenant_runtime:
+            from db import save_call_log
+            save_call_log(
+                phone=caller_phone,
+                duration=duration,
+                transcript=transcript_text,
+                summary=booking_status_msg,
+                recording_url=recording_url,
+                caller_name=agent_tools.caller_name or "",
+                sentiment=sentiment,
+                estimated_cost_usd=estimated_cost,
+                call_date=call_dt.date().isoformat(),
+                call_hour=call_dt.hour,
+                call_day_of_week=call_dt.strftime("%A"),
+                was_booked=bool(agent_tools.booking_intent),
+                interrupt_count=interrupt_count,
+            )
 
+        postgres_call_log_id = None
         if is_postgres_enabled() and tenant_id:
             try:
-                insert_call_log(
+                postgres_call_log_id = insert_call_log(
                     tenant_id=tenant_id,
                     phone_number=caller_phone,
                     duration_seconds=duration,
@@ -929,13 +1047,45 @@ async def entrypoint(ctx: JobContext):
                 )
                 logger.info(
                     "[POSTGRES] Call log dual-write complete",
-                    extra={"call_id": call_id, "tenant_id": tenant_id},
+                    extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked},
                 )
             except Exception as e:
                 logger.warning(
                     "[POSTGRES] Call log dual-write skipped",
-                    extra={"call_id": call_id, "tenant_id": tenant_id, "error_type": type(e).__name__},
+                    extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "error_type": type(e).__name__},
                 )
+
+            if recording_storage_key:
+                await record_livekit_upload_metadata(
+                    tenant_id=tenant_id,
+                    call_log_id=postgres_call_log_id,
+                    call_id=call_id,
+                    storage_key=recording_storage_key,
+                    duration_seconds=recording_duration_seconds or duration,
+                    file_size=recording_file_size,
+                    upload_status=recording_upload_status,
+                )
+
+            if booking_result and booking_result.get("success") and agent_tools.booking_intent:
+                try:
+                    from uuid import UUID as _UUID
+                    from backend.services.booking_service import BookingService
+
+                    intent = agent_tools.booking_intent
+                    BookingService().record_booking(
+                        tenant_id=_UUID(str(tenant_id)),
+                        call_log_id=postgres_call_log_id,
+                        patient_name=intent["caller_name"] or "Unknown Caller",
+                        patient_phone=intent["caller_phone"],
+                        start_time=_parse_booking_datetime(intent["start_time"]),
+                        cal_booking_uid=str(booking_result.get("booking_id") or ""),
+                        status="confirmed",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[POSTGRES] Booking write skipped",
+                        extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "error_type": type(e).__name__},
+                    )
 
     ctx.add_shutdown_callback(unified_shutdown_hook)
 
@@ -945,7 +1095,7 @@ def _extract_dialed_did(ctx: JobContext, metadata: dict) -> str | None:
     for key in ("did", "dialed_did", "dialed_number", "called_number", "to"):
         value = metadata.get(key)
         if value:
-            return str(value)
+            return _clean_did_value(value)
 
     room_metadata = getattr(ctx.room, "metadata", "") or ""
     if room_metadata:
@@ -954,7 +1104,7 @@ def _extract_dialed_did(ctx: JobContext, metadata: dict) -> str | None:
             for key in ("did", "dialed_did", "dialed_number", "called_number", "to"):
                 value = room_meta.get(key)
                 if value:
-                    return str(value)
+                    return _clean_did_value(value)
         except Exception:
             pass
 
@@ -964,15 +1114,47 @@ def _extract_dialed_did(ctx: JobContext, metadata: dict) -> str | None:
             "sip.to",
             "sip.toNumber",
             "sip.calledNumber",
+            "sip.requestUri",
             "sip.trunkPhoneNumber",
             "calledNumber",
             "dialedNumber",
+            "to",
         ):
             value = attr.get(key)
             if value:
-                return str(value)
+                return _clean_did_value(value)
 
     return None
+
+
+def _clean_did_value(value) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("sip:"):
+        raw = raw[4:]
+    if raw.startswith("tel:"):
+        raw = raw[4:]
+    raw = raw.split("@", 1)[0].split(";", 1)[0]
+    match = re.search(r"\+?\d{7,15}", raw)
+    return match.group(0) if match else raw
+
+
+def _coerce_business_hours(value) -> dict | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _parse_booking_datetime(value: str) -> datetime:
+    normalized = str(value or "").replace("Z", "+00:00")
+    return datetime.fromisoformat(normalized)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -983,5 +1165,5 @@ if __name__ == "__main__":
     run_startup_checks("voice-agent")
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
-        agent_name="outbound-caller",
+        agent_name=os.getenv("LIVEKIT_AGENT_NAME", "inbound-receptionist"),
     ))
