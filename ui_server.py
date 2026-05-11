@@ -549,6 +549,35 @@ async def api_auth_logout(response: Response):
     _clear_session_cookie(response)
     return {"ok": True}
 
+@app.get("/api/auth/_diag")
+async def api_auth_diag():
+    """Diagnostic: confirms which code is running. Safe — never exposes actual password values."""
+    expected_email = (
+        os.environ.get("DASHBOARD_EMAIL")
+        or os.environ.get("ADMIN_EMAIL")
+        or "harshhavanur2005@gmail.com"
+    )
+    expected_password = (
+        os.environ.get("DASHBOARD_PASSWORD")
+        or os.environ.get("ADMIN_PASSWORD")
+        or "RapidX-Voice-7421"
+    )
+    expected_slug = os.environ.get("DASHBOARD_TENANT_SLUG") or "default"
+    return {
+        "build_marker": "phase3a-credentials-fallback-v1",
+        "use_postgres": is_postgres_enabled(),
+        "fallback_active": {
+            "email_from": "env" if (os.environ.get("DASHBOARD_EMAIL") or os.environ.get("ADMIN_EMAIL")) else "code_default",
+            "password_from": "env" if (os.environ.get("DASHBOARD_PASSWORD") or os.environ.get("ADMIN_PASSWORD")) else "code_default",
+            "slug_from": "env" if os.environ.get("DASHBOARD_TENANT_SLUG") else "code_default",
+        },
+        "expected_email": expected_email,
+        "expected_password_length": len(expected_password),
+        "expected_password_first2": expected_password[:2],
+        "expected_password_last2": expected_password[-2:],
+        "expected_slug": expected_slug,
+    }
+
 @app.get("/api/auth/me")
 async def api_auth_me(user: dict = Depends(require_session)):
     return {"user": _user_for_response(user)}
