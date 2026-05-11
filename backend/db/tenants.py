@@ -75,31 +75,6 @@ def ensure_tenants_schema() -> None:
                 cur.execute(statement)
             cur.execute(
                 """
-                DO $$
-                BEGIN
-                    IF to_regclass('public.tenant_config') IS NOT NULL THEN
-                        UPDATE tenants AS t
-                        SET system_prompt = COALESCE(NULLIF(t.system_prompt, ''), tc.agent_instructions, ''),
-                            welcome_message = COALESCE(NULLIF(t.welcome_message, ''), tc.first_line, ''),
-                            voice = CASE
-                                WHEN t.voice IS NULL OR t.voice IN ('', 'kavya')
-                                    THEN COALESCE(NULLIF(tc.tts_voice, ''), 'kavya')
-                                ELSE t.voice
-                            END,
-                            languages = CASE
-                                WHEN t.languages IS NULL OR t.languages IN ('', 'multilingual')
-                                    THEN COALESCE(NULLIF(tc.lang_preset, ''), NULLIF(tc.tts_language, ''), 'multilingual')
-                                ELSE t.languages
-                            END
-                        FROM tenant_config AS tc
-                        WHERE tc.tenant_id = t.id;
-                    END IF;
-                END $$;
-                """
-            )
-            cur.execute("ALTER TABLE tenants DROP COLUMN IF EXISTS slug")
-            cur.execute(
-                """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_phone_digits
                 ON tenants ((regexp_replace(phone_number, '[^0-9]', '', 'g')))
                 """

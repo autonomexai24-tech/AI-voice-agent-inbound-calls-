@@ -76,12 +76,11 @@ PSTN caller  ─►  Vobiz SIP trunk  ─►  LiveKit room (auto-dispatch)
 
 ### A.5 Tenant model
 
-- Tables: `tenants`, `users`, `tenant_config`, `call_logs`, `bookings`,
-  `notification_events`, `call_recordings`. Migrations 001–004.
-- Resolution: DID (called number) → `tenants.phone_number` → tenant_id →
-  `tenant_config` row. Implemented at `backend/services/tenant_service.py:30`.
-- Voice runtime resolution: `backend/core/config_resolver.py:68`
-  (`resolve_runtime_config`) — Postgres first, JSON fallback, env defaults.
+- Runtime table: `tenants` only for the inbound voice MVP.
+- Resolution: DID (called number) → `tenants.phone_number` → prompt,
+  greeting, language, and voice on the same row.
+- Voice runtime resolution: `backend/core/config_resolver.py`
+  (`resolve_runtime_config`) — `postgres.tenants` first, then safe fallback.
 - Active flag: `tenants.is_active`; agent refuses calls for inactive tenants
   (`agent.py:411-433`).
 

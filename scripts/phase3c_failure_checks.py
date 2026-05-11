@@ -152,7 +152,7 @@ async def check_calcom_failure() -> dict:
 async def main() -> None:
     results = {
         "postgres_unavailable": check_postgres_unavailable(),
-        "missing_tenant_config_or_invalid_did": check_invalid_did_metadata(),
+        "missing_tenant_or_invalid_did": check_invalid_did_metadata(),
         "missing_optional_integrations": check_missing_optional_integrations(),
         "sms_failure": await check_sms_failure(),
         "calcom_failure": await check_calcom_failure(),

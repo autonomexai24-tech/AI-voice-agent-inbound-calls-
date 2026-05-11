@@ -91,10 +91,10 @@ Use an **adapter layer**: create new `backend/db/` module with psycopg2, then re
 
 ### Schema
 
-Deploy the full schema from `ARCHITECTURE.md` §4:
-- `tenants`, `users`, `tenant_config`, `call_logs`, `bookings`, `notification_events`, `call_recordings`
-- Every table has `tenant_id`
-- For Phase 1 single-tenant: create one seed tenant row, hardcode tenant_id in agent
+Deploy the simplified inbound schema:
+- `tenants` only
+- DID lookup uses normalized `phone_number`
+- Prompt, greeting, language, and voice live directly on the tenant row
 
 ### Risks
 
@@ -447,10 +447,10 @@ Enable true multi-tenant operation: multiple businesses, each with their own DID
 
 ### Strategy
 
-This phase wires together everything built in Phases 1–6. The schema already supports `tenant_id`. The auth already scopes by tenant. This phase adds:
-- Tenant provisioning (create tenant + user + config + DID mapping)
-- Voice agent reads tenant_id from DID at call start (instead of hardcoded)
-- Dashboard shows only tenant's own data (already enforced by auth middleware)
+This phase wires together everything built in Phases 1–6. The simplified runtime schema keeps tenant identity and AI behavior on one row. This phase adds:
+- Tenant provisioning (create tenant + DID mapping + prompt/greeting/language/voice)
+- Voice agent reads tenant_id from DID at call start
+- Dashboard shows only tenant's own data
 
 ### Files Touched
 
@@ -465,12 +465,12 @@ This phase wires together everything built in Phases 1–6. The schema already s
 ### Tenant Provisioning Flow
 
 ```
-1. Admin creates tenant (name, slug, phone_number/DID)
-2. Admin creates user (email, password) linked to tenant
-3. Admin sets tenant_config (prompt, voice, language, hours)
+1. Startup creates/seeds tenant (name, phone_number/DID, prompt, greeting, language, voice)
+2. Dashboard login uses workspace slug derived from tenant name plus env password
+3. Dashboard edits update the same tenant row
 4. Vobiz DID configured to route to LiveKit SIP gateway
 5. Business owner logs in → sees their dashboard
-6. Inbound call to their DID → agent loads their config
+6. Inbound call to their DID → agent loads their tenant row
 ```
 
 ### Risks

@@ -100,7 +100,7 @@ If `silence_to_speech_estimate > 1500ms`, identify which stage dominates.
 Two options, both already implemented:
 
 **Option 1: Groq llama-3.3-70b** — sub-300ms TTFT, free.
-- In dashboard or `tenant_config`: set `llm_provider="groq"` and
+- In the dashboard tenant runtime settings: set `llm_provider="groq"` and
   `llm_model="llama-3.3-70b-versatile"`.
 - Already wired at `agent.py:510-515`.
 - Trade-off: slightly different reply style; verify booking flow still works.
@@ -112,7 +112,7 @@ Two options, both already implemented:
 ### B.3 If TTS `ttfb_ms > 350ms` → switch to ElevenLabs Turbo v2.5
 
 - Already implemented at `agent.py:560-568`.
-- In `tenant_config`: `tts_provider="elevenlabs"`, `elevenlabs_voice_id=<id>`.
+- In the dashboard tenant runtime settings: `tts_provider="elevenlabs"`, `elevenlabs_voice_id=<id>`.
 - Trade-off: cost (~$0.30 per 1k chars vs Sarvam free-tier).
 - Cuts TTFB to ~150ms.
 
@@ -135,7 +135,7 @@ Check log line at `agent.py:320`:
 ```
 
 If `N > 600`:
-- Shorten `agent_instructions` in `tenant_config`.
+- Shorten `system_prompt` / agent instructions on the tenant row.
 - Drop the IST 7-day table to today + tomorrow only (saves ~80 tokens) — edit `backend/voice/prompts.py:32-39`.
 - Drop unused language directive instructions for non-active presets.
 

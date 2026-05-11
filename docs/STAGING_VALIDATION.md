@@ -190,28 +190,27 @@ Preconditions:
 psql "$DATABASE_URL" -f migrations/001_initial.sql
 ```
 
-Seed one tenant row with the staging DID and one matching `tenant_config` row.
+Seed one `tenants` row with the staging DID, prompt, greeting, language, and voice.
 
 Expected behavior:
 
 - Startup attempts pool initialization.
 - If DB is reachable, logs show `startup.postgres_initialized`.
 - DID resolves to tenant.
-- Config source log shows `config_source=postgres`.
+- Config source log shows `config_source=postgres.tenants`.
 - Post-call call log dual-write completes when tenant is resolved.
-- Supabase legacy write still happens.
+- Missing optional call-log tables are skipped without crashing the live call.
 
 Failure symptoms:
 
 - `tenant.resolve.error`.
-- `tenant.resolve.fallback`.
-- `config_source=config.json` when DID should resolve.
+- `tenant.resolve.not_found`.
+- `config_source=safe_fallback` when DID should resolve.
 - Postgres call-log dual-write skipped.
 
 Rollback action:
 
-- Set `USE_POSTGRES=false`.
-- Keep Supabase fallback active.
+- Redeploy with the corrected `DEFAULT_PHONE_NUMBER` and tenant row.
 - Check tenant `phone_number` matches DID exactly.
 - Check migration was applied.
 
@@ -228,7 +227,7 @@ python scripts/phase3c_failure_checks.py
 Expected behavior:
 
 - `postgres_unavailable.ok=true`.
-- `missing_tenant_config_or_invalid_did.ok=true`.
+- `missing_tenant_or_invalid_did.ok=true`.
 - `missing_optional_integrations.ok=true`.
 - `sms_failure.ok=true`.
 - `calcom_failure.ok=true`.
@@ -236,7 +235,7 @@ Expected behavior:
 Failure symptoms:
 
 - Missing optional integrations crash startup.
-- Invalid DID raises instead of falling back to JSON config.
+- Invalid DID raises instead of using the safe fallback.
 - SMS provider exception escapes.
 - Simulated Cal.com failure returns success.
 
