@@ -332,25 +332,51 @@ def _postgres_login(email: str, password: str, tenant_slug: str | None = None) -
     }
 
 def _authenticate(email: str, password: str, tenant_slug: str | None = None) -> dict | None:
-    return _postgres_login(email, password, tenant_slug) or _env_login(email, password, tenant_slug)
+    """Postgres-first, env-default-fallback. Postgres errors must never block env login."""
+    try:
+        result = _postgres_login(email, password, tenant_slug)
+        if result is not None:
+            return result
+    except AmbiguousTenantLogin:
+        # bubble up — handler turns this into 409 Workspace required
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("auth.postgres_login_failed", extra={"error_type": type(exc).__name__})
+    return _env_login(email, password, tenant_slug)
 
-def _set_session_cookie(response: Response, token: str) -> None:
+def _session_cookie_kwargs() -> dict:
+    """Cookie attribute set used by both set/clear; honors SESSION_COOKIE_DOMAIN env."""
     secure = _is_production() or (os.environ.get("SESSION_COOKIE_SECURE") or "").lower() == "true"
     samesite = (os.environ.get("SESSION_COOKIE_SAMESITE") or "lax").lower()
     if samesite not in {"lax", "strict", "none"}:
         samesite = "lax"
+    domain = (os.environ.get("SESSION_COOKIE_DOMAIN") or "").strip() or None
+    kwargs: dict = {
+        "httponly": True,
+        "secure": secure,
+        "samesite": samesite,
+        "path": "/",
+    }
+    if domain:
+        kwargs["domain"] = domain
+    return kwargs
+
+def _set_session_cookie(response: Response, token: str) -> None:
     response.set_cookie(
         SESSION_COOKIE,
         token,
         max_age=SESSION_TTL_SECONDS,
-        httponly=True,
-        secure=secure,
-        samesite=samesite,
-        path="/",
+        **_session_cookie_kwargs(),
     )
 
 def _clear_session_cookie(response: Response) -> None:
-    response.delete_cookie(SESSION_COOKIE, path="/")
+    kwargs = _session_cookie_kwargs()
+    # delete_cookie only accepts a subset of kwargs
+    response.delete_cookie(
+        SESSION_COOKIE,
+        path=kwargs.get("path", "/"),
+        domain=kwargs.get("domain"),
+    )
 
 def _tenant_uuid(session: dict) -> UUID | None:
     tenant_id = session.get("tenant_id")
@@ -565,6 +591,7 @@ async def api_auth_diag():
     expected_slug = os.environ.get("DASHBOARD_TENANT_SLUG") or "default"
     return {
         "build_marker": "phase3a-credentials-fallback-v1",
+        "build_rev": os.environ.get("BUILD_REV", "unknown"),
         "use_postgres": is_postgres_enabled(),
         "fallback_active": {
             "email_from": "env" if (os.environ.get("DASHBOARD_EMAIL") or os.environ.get("ADMIN_EMAIL")) else "code_default",
@@ -825,7 +852,9 @@ except ImportError:
 
 @app.get("/health")
 def health_check():
-    return aggregate_health(service="rapidx-ai-voice-agent")
+    base = aggregate_health(service="rapidx-ai-voice-agent")
+    base["build_rev"] = os.environ.get("BUILD_REV", "unknown")
+    return base
 
 
 @app.get("/")

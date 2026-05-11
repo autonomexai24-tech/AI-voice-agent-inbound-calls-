@@ -72,6 +72,11 @@ ENV API_BASE_URL=http://127.0.0.1:8000
 ENV HOSTNAME=0.0.0.0
 ENV PORT=3000
 
+# Build identifier — pass via `--build-arg BUILD_REV=$GIT_SHA` (EasyPanel build args).
+# Defaults to "unknown" so local builds still succeed.
+ARG BUILD_REV=unknown
+ENV BUILD_REV=${BUILD_REV}
+
 # Expose frontend, API, and LiveKit agent ports
 EXPOSE 3000 8000 8081
 
