@@ -46,7 +46,15 @@ TENANT_CHILD_TABLES = ("call_logs", "bookings", "notification_events", "call_rec
 
 
 def ensure_tenants_schema() -> None:
-    """Create or upgrade the single tenants table required by the MVP."""
+    """Create or upgrade the single tenants table required by the MVP.
+
+    Split into two committed transactions so that duplicate-slug cleanup
+    is persisted even if the subsequent unique index creation fails.
+    Without this split, the CREATE UNIQUE INDEX failure rolls back the
+    entire transaction (including the dedup DELETE), causing an infinite
+    crash loop on supervisor restart.
+    """
+    # ── Transaction 1: schema migration + slug backfill + dedup ───────
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute('CREATE EXTENSION IF NOT EXISTS "pgcrypto"')
@@ -81,7 +89,35 @@ def ensure_tenants_schema() -> None:
             ):
                 cur.execute(statement)
             cur.execute("UPDATE tenants SET slug = regexp_replace(lower(trim(name)), '[^a-z0-9]+', '-', 'g') WHERE slug = ''")
-            _delete_duplicate_tenant_slugs(cur)
+            deleted = _delete_duplicate_tenant_slugs(cur)
+            if deleted:
+                logger.info("tenants.dedup.committed", extra={"deleted_count": deleted})
+            # Deactivate any remaining active-slug duplicates that the
+            # row-delete pass could not remove (e.g. FK constraints).
+            cur.execute(
+                """
+                UPDATE tenants
+                SET is_active = FALSE
+                WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id,
+                               row_number() OVER (
+                                   PARTITION BY lower(slug)
+                                   ORDER BY created_at ASC, id::text ASC
+                               ) AS rn
+                        FROM tenants
+                        WHERE is_active = TRUE
+                          AND NULLIF(slug, '') IS NOT NULL
+                    ) sub
+                    WHERE rn > 1
+                )
+                """
+            )
+    # Transaction 1 is now committed — dedup is durable.
+
+    # ── Transaction 2: create indexes ─────────────────────────────────
+    with get_connection() as conn:
+        with conn.cursor() as cur:
             cur.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_phone_digits
