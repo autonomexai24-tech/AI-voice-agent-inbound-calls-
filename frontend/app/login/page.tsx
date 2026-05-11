@@ -3,6 +3,7 @@
 import { FormEvent, useState } from "react";
 import { Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import Link from "next/link";
 import { postJson } from "@/lib/api";
 
 function LoginForm() {
@@ -83,6 +84,12 @@ function LoginForm() {
             {loading ? "Signing in" : "Sign in"}
           </button>
         </form>
+        <div className="mt-6 text-center text-sm text-slate-600">
+          Don&apos;t have an account?{" "}
+          <Link href="/signup" className="font-semibold text-brand hover:underline">
+            Create account
+          </Link>
+        </div>
       </div>
     </main>
   );

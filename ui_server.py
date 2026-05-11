@@ -253,10 +253,18 @@ def _verify_password(password: str, stored_hash: str) -> bool:
             return False
     return False
 
+# Baked-in fallback dashboard credentials. Override in production by
+# setting DASHBOARD_EMAIL / DASHBOARD_PASSWORD env vars on EasyPanel.
+# Intentionally simple to eliminate typing errors during onboarding.
+_DEFAULT_DASHBOARD_EMAIL_CONST = "harshhavanur2005@gmail.com"
+_DEFAULT_DASHBOARD_PASSWORD_CONST = "admin123"
+_DEFAULT_DASHBOARD_SLUG_CONST = "default"
+
+
 def _env_login(email: str, password: str, tenant_slug: str | None = None) -> dict | None:
-    _DEFAULT_DASHBOARD_EMAIL = "harshhavanur2005@gmail.com"
-    _DEFAULT_DASHBOARD_PASSWORD = "RapidX-Voice-7421"
-    _DEFAULT_DASHBOARD_SLUG = "default"
+    _DEFAULT_DASHBOARD_EMAIL = _DEFAULT_DASHBOARD_EMAIL_CONST
+    _DEFAULT_DASHBOARD_PASSWORD = _DEFAULT_DASHBOARD_PASSWORD_CONST
+    _DEFAULT_DASHBOARD_SLUG = _DEFAULT_DASHBOARD_SLUG_CONST
     expected_email = (
         os.environ.get("DASHBOARD_EMAIL")
         or os.environ.get("ADMIN_EMAIL")
@@ -575,20 +583,86 @@ async def api_auth_logout(response: Response):
     _clear_session_cookie(response)
     return {"ok": True}
 
+
+@app.post("/api/auth/signup")
+async def api_auth_signup(request: Request, response: Response):
+    """Self-serve account creation. Provisions tenant + user + tenant_config in one transaction.
+
+    Required fields: name (full name or business name), company, phone_number, email, password.
+    Returns 503 when Postgres is disabled (signup requires real DB persistence).
+    Rate-limited to 3 attempts per IP per hour.
+    """
+    if not is_postgres_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Account signup requires PostgreSQL. Contact support.",
+        )
+
+    _assert_rate_limit(request, "signup", limit=3, window_seconds=3600)
+
+    data = await _json_body(request)
+    name = (data.get("name") or "").strip()
+    company = (data.get("company") or data.get("company_name") or "").strip()
+    phone_number = (data.get("phone_number") or data.get("phone") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    # Input validation
+    if not name or len(name) < 2:
+        raise HTTPException(status_code=400, detail="Full name is required (minimum 2 characters)")
+    if not company or len(company) < 2:
+        raise HTTPException(status_code=400, detail="Company name is required (minimum 2 characters)")
+    if not phone_number or len(phone_number) < 7:
+        raise HTTPException(status_code=400, detail="A valid phone number is required")
+    if "@" not in email or "." not in email or len(email) < 5:
+        raise HTTPException(status_code=400, detail="A valid email is required")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    try:
+        from backend.services.tenant_service import TenantService
+
+        result = TenantService().provision(
+            name=company,
+            phone_number=phone_number,
+            user_email=email,
+            user_password=password,
+            config={"agent_instructions": "", "first_line": f"Hello, this is {company}. How can I help you today?"},
+            is_active=True,
+        )
+    except ValueError as exc:
+        # provision_tenant raises ValueError on duplicate phone/email/slug
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("signup.failed", extra={"error_type": type(exc).__name__})
+        raise HTTPException(status_code=500, detail="Account creation failed. Please try again.")
+
+    tenant = result["tenant"]
+    user_payload = {
+        "email": result["user"]["email"],
+        "tenant_id": str(tenant["id"]),
+        "tenant_name": tenant["name"],
+        "tenant_slug": tenant["slug"],
+        "tenant_phone": tenant.get("phone_number") or "",
+    }
+    _set_session_cookie(response, _create_session(user_payload))
+    logger.info("signup.success", extra={"tenant_id": str(tenant["id"]), "tenant_slug": tenant["slug"]})
+    return {"user": user_payload}
+
 @app.get("/api/auth/_diag")
 async def api_auth_diag():
     """Diagnostic: confirms which code is running. Safe — never exposes actual password values."""
     expected_email = (
         os.environ.get("DASHBOARD_EMAIL")
         or os.environ.get("ADMIN_EMAIL")
-        or "harshhavanur2005@gmail.com"
+        or _DEFAULT_DASHBOARD_EMAIL_CONST
     )
     expected_password = (
         os.environ.get("DASHBOARD_PASSWORD")
         or os.environ.get("ADMIN_PASSWORD")
-        or "RapidX-Voice-7421"
+        or _DEFAULT_DASHBOARD_PASSWORD_CONST
     )
-    expected_slug = os.environ.get("DASHBOARD_TENANT_SLUG") or "default"
+    expected_slug = os.environ.get("DASHBOARD_TENANT_SLUG") or _DEFAULT_DASHBOARD_SLUG_CONST
     return {
         "build_marker": "phase3a-credentials-fallback-v1",
         "build_rev": os.environ.get("BUILD_REV", "unknown"),

@@ -15,7 +15,7 @@ export function middleware(request: NextRequest) {
     return NextResponse.redirect(loginUrl);
   }
 
-  if (pathname === "/login" && hasSession) {
+  if ((pathname === "/login" || pathname === "/signup") && hasSession) {
     const dashboardUrl = request.nextUrl.clone();
     dashboardUrl.pathname = "/dashboard";
     dashboardUrl.search = "";
@@ -26,5 +26,5 @@ export function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/login", "/dashboard/:path*", "/calls/:path*", "/bookings/:path*", "/settings/:path*"],
+  matcher: ["/login", "/signup", "/dashboard/:path*", "/calls/:path*", "/bookings/:path*", "/settings/:path*"],
 };
