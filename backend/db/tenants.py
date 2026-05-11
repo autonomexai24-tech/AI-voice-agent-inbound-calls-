@@ -42,6 +42,7 @@ LANGUAGE_PRESET_TO_CODE = {
     "kannada": "kn-IN",
     "malayalam": "ml-IN",
 }
+TENANT_CHILD_TABLES = ("call_logs", "bookings", "notification_events", "call_recordings")
 
 
 def ensure_tenants_schema() -> None:
@@ -80,7 +81,7 @@ def ensure_tenants_schema() -> None:
             ):
                 cur.execute(statement)
             cur.execute("UPDATE tenants SET slug = regexp_replace(lower(trim(name)), '[^a-z0-9]+', '-', 'g') WHERE slug = ''")
-            _deactivate_duplicate_active_slugs(cur)
+            _delete_duplicate_tenant_slugs(cur)
             cur.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_phone_digits
@@ -94,6 +95,7 @@ def ensure_tenants_schema() -> None:
                 WHERE is_active = TRUE
                 """
             )
+            logger.info("unique.index.created", extra={"index": "idx_tenants_slug_lower"})
             cur.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_tenants_active_phone_digits
@@ -209,52 +211,79 @@ def seed_default_tenant_from_env() -> Optional[dict]:
     return tenant
 
 
-def _deactivate_duplicate_active_slugs(cur) -> None:
-    """Keep one active tenant per slug so the startup unique index can exist."""
+def cleanup_duplicate_tenant_slugs() -> int:
+    """Delete duplicate tenant rows by slug, keeping the oldest row."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            return _delete_duplicate_tenant_slugs(cur)
+
+
+def _delete_duplicate_tenant_slugs(cur) -> int:
+    """Keep the oldest tenant row per slug and delete duplicate rows."""
     cur.execute(
         """
         WITH ranked AS (
             SELECT
                 id,
+                first_value(id) OVER (
+                    PARTITION BY lower(slug)
+                    ORDER BY created_at ASC, id::text ASC
+                ) AS keep_id,
                 lower(slug) AS slug_key,
                 row_number() OVER (
                     PARTITION BY lower(slug)
-                    ORDER BY
-                        CASE
-                            WHEN NULLIF(system_prompt, '') IS NOT NULL
-                             AND NULLIF(welcome_message, '') IS NOT NULL
-                            THEN 0
-                            ELSE 1
-                        END,
-                        created_at ASC,
-                        id::text ASC
+                    ORDER BY created_at ASC, id::text ASC
                 ) AS row_number
             FROM tenants
-            WHERE is_active = TRUE
-              AND NULLIF(slug, '') IS NOT NULL
-        ),
-        deactivated AS (
-            UPDATE tenants AS tenant
-            SET is_active = FALSE
-            FROM ranked
-            WHERE tenant.id = ranked.id
-              AND ranked.row_number > 1
-            RETURNING ranked.slug_key
+            WHERE NULLIF(slug, '') IS NOT NULL
         )
-        SELECT slug_key, count(*) AS deactivated_count
-        FROM deactivated
-        GROUP BY slug_key
+        SELECT id, keep_id, slug_key
+        FROM ranked
+        WHERE row_number > 1
         """
     )
-    for slug_key, deactivated_count in cur.fetchall():
-        logger.info(
-            "tenant.seed.skipped",
-            extra={
-                "tenant_slug": slug_key,
-                "reason": "duplicate_active_slug_deactivated",
-                "deactivated_count": int(deactivated_count or 0),
-            },
-        )
+    duplicates = cur.fetchall()
+    if not duplicates:
+        return 0
+
+    duplicate_ids = [str(row[0]) for row in duplicates]
+    duplicate_pairs = [(str(row[0]), str(row[1])) for row in duplicates]
+    slug_keys = sorted({str(row[2]) for row in duplicates})
+
+    for table_name in TENANT_CHILD_TABLES:
+        if not _table_exists(cur, table_name):
+            continue
+        for duplicate_id, keep_id in duplicate_pairs:
+            cur.execute(
+                f"""
+                UPDATE {table_name}
+                SET tenant_id = %s
+                WHERE tenant_id = %s
+                """,
+                (keep_id, duplicate_id),
+            )
+
+    cur.execute(
+        """
+        DELETE FROM tenants
+        WHERE id = ANY(%s::uuid[])
+        """,
+        (duplicate_ids,),
+    )
+    logger.info(
+        "duplicate.tenants.cleaned",
+        extra={
+            "deleted_count": len(duplicate_ids),
+            "tenant_slugs": ",".join(slug_keys),
+        },
+    )
+    return len(duplicate_ids)
+
+
+def _table_exists(cur, table_name: str) -> bool:
+    cur.execute("SELECT to_regclass(%s)", (f"public.{table_name}",))
+    row = cur.fetchone()
+    return bool(row and row[0])
 
 
 def get_tenant_by_did(phone_number: str) -> Optional[dict]:
