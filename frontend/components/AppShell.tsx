@@ -20,9 +20,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
+  const [showSignupBanner, setShowSignupBanner] = useState(false);
 
   useEffect(() => {
     let active = true;
+    setShowSignupBanner(new URLSearchParams(window.location.search).get("signup") === "1");
 
     apiFetch<{ user: User }>("/api/auth/me")
       .then((data) => {
@@ -88,6 +90,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </nav>
         <div className="hidden border-t border-line p-5 lg:absolute lg:bottom-0 lg:left-0 lg:right-0 lg:block">
           <div className="truncate text-sm font-semibold text-ink">{user?.tenant_name || "Tenant"}</div>
+          {user?.tenant_slug ? <div className="mt-1 truncate font-mono text-xs text-slate-500">{user.tenant_slug}</div> : null}
           {user?.tenant_phone ? <div className="mt-1 truncate text-xs text-slate-500">{user.tenant_phone}</div> : null}
           <div className="mt-1 truncate text-xs text-slate-500">{user?.email}</div>
           <button
@@ -105,6 +108,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <div className="min-w-0">
               <div className="text-xs font-semibold uppercase text-slate-500">Tenant</div>
               <div className="truncate text-sm font-semibold text-ink">{user?.tenant_name}</div>
+              {user?.tenant_slug ? <div className="truncate font-mono text-xs text-slate-500">{user.tenant_slug}</div> : null}
               {user?.tenant_phone ? <div className="truncate text-xs text-slate-500">{user.tenant_phone}</div> : null}
             </div>
             <button
@@ -116,7 +120,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </button>
           </div>
         </header>
-        <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">{children}</main>
+        <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+          {showSignupBanner && user?.tenant_slug ? (
+            <div className="mb-6 rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+              <span className="font-semibold">Workspace slug:</span>{" "}
+              <span className="font-mono text-emerald-950">{user.tenant_slug}</span>
+            </div>
+          ) : null}
+          {children}
+        </main>
       </div>
     </div>
   );

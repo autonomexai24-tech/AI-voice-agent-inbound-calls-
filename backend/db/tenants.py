@@ -117,16 +117,18 @@ def create_tenant(
 ) -> UUID:
     """Create a tenant row and return its id."""
     normalized_phone = _normalize_phone_for_storage(phone_number)
+    clean_slug = _slugify(slug)
     with get_connection() as conn:
         with conn.cursor() as cur:
             _raise_if_did_exists(cur, normalized_phone)
+            _raise_if_slug_exists(cur, clean_slug)
             cur.execute(
                 """
                 INSERT INTO tenants (name, slug, phone_number, is_active)
                 VALUES (%s, %s, %s, %s)
                 RETURNING id
                 """,
-                (name.strip(), _slugify(slug), normalized_phone, is_active),
+                (name.strip(), clean_slug, normalized_phone, is_active),
             )
             (tenant_id,) = cur.fetchone()
             return tenant_id
@@ -154,6 +156,8 @@ def update_tenant(tenant_id: UUID, updates: dict[str, Any]) -> bool:
         with conn.cursor() as cur:
             if "phone_number" in clean:
                 _raise_if_did_exists(cur, clean["phone_number"], exclude_tenant_id=tenant_id)
+            if "slug" in clean:
+                _raise_if_slug_exists(cur, clean["slug"], exclude_tenant_id=tenant_id)
             cur.execute(
                 f"""
                 UPDATE tenants
@@ -222,22 +226,37 @@ def provision_tenant(
 ) -> dict:
     """Provision tenant, first user, and tenant_config in one transaction."""
     clean_name = name.strip()
-    clean_slug = _slugify(slug or clean_name)
+    requested_slug = _slugify(slug) if slug else None
+    clean_slug = requested_slug or _slugify(clean_name)
     clean_phone = _normalize_phone_for_storage(phone_number)
     clean_config = _clean_config(config or {})
 
     with get_connection() as conn:
         with conn.cursor() as cur:
             _raise_if_did_exists(cur, clean_phone)
-            cur.execute(
-                """
-                INSERT INTO tenants (name, slug, phone_number, is_active)
-                VALUES (%s, %s, %s, %s)
-                RETURNING id, name, slug, phone_number, is_active, created_at
-                """,
-                (clean_name, clean_slug, clean_phone, is_active),
-            )
-            tenant = _tenant_row(cur.fetchone())
+            if requested_slug:
+                _raise_if_slug_exists(cur, requested_slug)
+            else:
+                clean_slug = _available_slug(cur, clean_slug)
+            base_slug = clean_slug
+            tenant = None
+            for _attempt in range(25):
+                cur.execute(
+                    """
+                    INSERT INTO tenants (name, slug, phone_number, is_active)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (slug) DO NOTHING
+                    RETURNING id, name, slug, phone_number, is_active, created_at
+                    """,
+                    (clean_name, clean_slug, clean_phone, is_active),
+                )
+                inserted = cur.fetchone()
+                if inserted is not None:
+                    tenant = _tenant_row(inserted)
+                    break
+                clean_slug = _available_slug(cur, base_slug)
+            if tenant is None:
+                raise ValueError("tenant_slug_unavailable")
 
             cur.execute(
                 """
@@ -443,3 +462,42 @@ def _raise_if_did_exists(cur, phone_number: str, exclude_tenant_id: Optional[UUI
     )
     if cur.fetchone():
         raise ValueError("tenant_did_already_exists")
+
+
+def _raise_if_slug_exists(cur, slug: str, exclude_tenant_id: Optional[UUID] = None) -> None:
+    params: list[Any] = [slug]
+    exclusion = ""
+    if exclude_tenant_id:
+        exclusion = "AND id <> %s"
+        params.append(str(exclude_tenant_id))
+    cur.execute(
+        f"""
+        SELECT id
+        FROM tenants
+        WHERE lower(slug) = lower(%s)
+          {exclusion}
+        LIMIT 1
+        """,
+        params,
+    )
+    if cur.fetchone():
+        raise ValueError("tenant_slug_already_exists")
+
+
+def _available_slug(cur, base_slug: str) -> str:
+    cur.execute(
+        """
+        SELECT slug
+        FROM tenants
+        WHERE lower(slug) = lower(%s)
+           OR lower(slug) LIKE lower(%s)
+        """,
+        (base_slug, f"{base_slug}-%"),
+    )
+    existing = {str(row[0]).lower() for row in cur.fetchall()}
+    if base_slug.lower() not in existing:
+        return base_slug
+    suffix = 2
+    while f"{base_slug}-{suffix}".lower() in existing:
+        suffix += 1
+    return f"{base_slug}-{suffix}"

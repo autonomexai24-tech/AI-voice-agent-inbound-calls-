@@ -450,6 +450,21 @@ async def entrypoint(ctx: JobContext):
     stt_provider  = live_config.get("stt_provider", "sarvam")
     stt_language  = live_config.get("stt_language", "unknown")  # auto-detect (#20)
     max_turns     = live_config.get("max_turns", 25)
+    logger.info(
+        "latency.call_config",
+        extra={
+            "call_id": call_id,
+            "tenant_id": tenant_id,
+            "did": did_masked,
+            "stt_provider": stt_provider,
+            "stt_language": stt_language,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+            "tts_provider": tts_provider,
+            "tts_language": tts_language,
+            "endpointing_delay": float(delay_setting),
+        },
+    )
 
     # ── Caller memory (#15) ───────────────────────────────────────────────
     async def get_caller_history(phone: str) -> str:
@@ -705,6 +720,7 @@ async def entrypoint(ctx: JobContext):
                     "call_id": call_id,
                     "tenant_id": tenant_id,
                     "did": did_masked,
+                    "turn_count": turn_count,
                     "latency_ms": round((time.perf_counter() - last_user_speech_at) * 1000, 2),
                 },
             )
@@ -734,6 +750,7 @@ async def entrypoint(ctx: JobContext):
                     "call_id": call_id,
                     "tenant_id": tenant_id,
                     "did": did_masked,
+                    "turn_count": turn_count,
                     "stt_received_at": getattr(ev, "created_at", None),
                     "language": getattr(ev, "language", None),
                 },
@@ -752,6 +769,7 @@ async def entrypoint(ctx: JobContext):
                     "call_id": call_id,
                     "tenant_id": tenant_id,
                     "did": did_masked,
+                    "turn_count": turn_count,
                     "duration_ms": round(getattr(metrics, "duration", 0.0) * 1000, 2),
                     "audio_duration_ms": round(getattr(metrics, "audio_duration", 0.0) * 1000, 2),
                     "streamed": getattr(metrics, "streamed", None),
@@ -764,6 +782,7 @@ async def entrypoint(ctx: JobContext):
                     "call_id": call_id,
                     "tenant_id": tenant_id,
                     "did": did_masked,
+                    "turn_count": turn_count,
                     "ttft_ms": round(getattr(metrics, "ttft", 0.0) * 1000, 2),
                     "duration_ms": round(getattr(metrics, "duration", 0.0) * 1000, 2),
                     "cancelled": getattr(metrics, "cancelled", None),
@@ -776,6 +795,7 @@ async def entrypoint(ctx: JobContext):
                     "call_id": call_id,
                     "tenant_id": tenant_id,
                     "did": did_masked,
+                    "turn_count": turn_count,
                     "ttfb_ms": round(getattr(metrics, "ttfb", 0.0) * 1000, 2),
                     "duration_ms": round(getattr(metrics, "duration", 0.0) * 1000, 2),
                     "audio_duration_ms": round(getattr(metrics, "audio_duration", 0.0) * 1000, 2),

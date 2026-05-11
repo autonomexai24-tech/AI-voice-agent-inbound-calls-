@@ -1,19 +1,26 @@
 "use client";
 
 import { FormEvent, useState } from "react";
-import { Suspense } from "react";
+import { Suspense, useEffect } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { postJson } from "@/lib/api";
+import type { User } from "@/lib/types";
 
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const workspaceParam = searchParams.get("workspace") || "";
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [tenantSlug, setTenantSlug] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    const savedWorkspace = window.localStorage.getItem("rapid_workspace_slug") || "";
+    setTenantSlug(workspaceParam || savedWorkspace);
+  }, [workspaceParam]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -21,7 +28,14 @@ function LoginForm() {
     setError("");
 
     try {
-      await postJson("/api/auth/login", { email, password, tenant_slug: tenantSlug.trim() || undefined });
+      const result = await postJson<{ user: User }>("/api/auth/login", {
+        email,
+        password,
+        tenant_slug: tenantSlug.trim() || undefined,
+      });
+      if (result.user.tenant_slug) {
+        window.localStorage.setItem("rapid_workspace_slug", result.user.tenant_slug);
+      }
       router.replace(searchParams.get("next") || "/dashboard");
       router.refresh();
     } catch (err) {
@@ -68,6 +82,8 @@ function LoginForm() {
               onChange={(event) => setTenantSlug(event.target.value)}
               type="text"
               autoComplete="organization"
+              placeholder="your-workspace"
+              required
               className="focus-ring mt-2 min-h-11 w-full rounded-md border border-line px-3 text-sm shadow-sm"
             />
           </label>

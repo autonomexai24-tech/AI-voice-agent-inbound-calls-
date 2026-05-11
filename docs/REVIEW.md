@@ -93,26 +93,22 @@ Browser ──► /login (Next.js page)  frontend/app/login/page.tsx
                   │ (proxied via Next rewrite to ui_server)
                   ▼
             ui_server.py `_authenticate()`     ui_server.py:334
-              1. _postgres_login()             ui_server.py:287
-                  ├─ raises AmbiguousTenantLogin if no workspace
+              1. _postgres_login()
+                  ├─ requires workspace slug
                   ├─ tenant slug lookup; user lookup; bcrypt verify
-                  └─ returns user dict OR None
-              2. _env_login()                  ui_server.py:256
-                  ├─ DASHBOARD_EMAIL / DASHBOARD_PASSWORD (env)
-                  ├─ falls back to baked-in defaults (commit 3b40147)
-                  └─ returns user dict OR None
+                  ├─ raises distinct AuthError reasons
+                  └─ returns PostgreSQL user dict
             On success: set HMAC-signed cookie `rapid_session`
                         (HttpOnly, Secure in prod, SameSite=Lax)
-                        ui_server.py:337-350
 
 Subsequent requests:
-  Browser ─► /api/* → cookie validated by `require_session` → tenant_id resolved
+  Browser ─► /api/* → cookie validated by `require_session`
+                   → tenant exists, active, and slug still matches
 ```
 
 - Session cookie is **stateless HMAC**, no DB session table.
 - Frontend middleware (`frontend/middleware.ts`) gates `/dashboard`,
-  `/calls`, `/bookings`, `/settings`. It only checks **cookie presence**,
-  not validity — actual validation is server-side in FastAPI.
+  `/calls`, `/bookings`, `/settings` by calling `/api/auth/session`.
 
 ### A.7 Storage
 
@@ -180,7 +176,7 @@ Subsequent requests:
 | Pair | Overlap | Resolution status |
 |---|---|---|
 | `db.py` (Supabase) vs `backend/db/call_logs.py` (Postgres) | Both write call logs | Branch on `USE_POSTGRES` (`agent.py:1018-1056`) — dual-write done |
-| `ui_server.py read_config()` vs `backend/core/config_resolver.py` | Both load config | UI uses `read_config`; agent uses `resolve_runtime_config`. Two truths. |
+| Dashboard config vs `backend/core/config_resolver.py` | Dashboard reads/writes PostgreSQL tenant config; agent resolves runtime config from PostgreSQL first | Dashboard file-backed config fallback removed from auth-protected API paths. |
 | `agent.py LANGUAGE_PRESETS` (removed in 3A) vs `backend/voice/language.py` | Was duplicate, now imported | Resolved (commit `237f9c4`) |
 | `ui_server.py` rate limiter vs `agent.py` rate limiter | Two independent limiters (login attempts vs caller calls) | Intentional, keep |
 
@@ -195,9 +191,9 @@ silent-fail patterns in code.
 |---|---|---|
 | LiveKit reconnect (network blip mid-call) | `agent.py` has no explicit reconnect handler | Call drops silently |
 | Postgres pool exhaustion under concurrent calls | `_DEFAULT_MAX_CONN=10`, may starve if 20+ concurrent calls hit shutdown hook | Connection wait stalls shutdown |
-| `_postgres_login` with non-existent slug + `_env_login` fallback | Needs both paths exercised | This is the live login bug |
-| Cookie auth across subdomains (e.g. `dhanushpackaging12.aivoice.ocznup.easypanel.host`) | `_set_session_cookie` doesn't set `domain=` | Cookies may not stick on EasyPanel's wildcard subdomain routing |
-| Multi-tenant isolation: tenant A's user reading tenant B's data | Every endpoint goes through `_tenant_uuid(session)`, but cross-tenant test never run | Potential data leak if any endpoint forgets the filter |
+| PostgreSQL-only login failure modes | Covered in `tests/test_auth_postgres_only.py` | Missing workspace, wrong workspace, invalid password, expired session |
+| Cookie auth across subdomains (e.g. `dhanushpackaging12.aivoice.ocznup.easypanel.host`) | `_session_cookie_kwargs` supports `SESSION_COOKIE_DOMAIN` | Verify exact EasyPanel host routing after deploy |
+| Multi-tenant isolation: tenant A's user reading tenant B's data | Covered in `tests/test_auth_postgres_only.py` for tenant-scoped logs | Keep adding endpoint-level isolation tests as APIs expand |
 | OpenAI timeout / 5xx during LLM streaming | No try/except around `agent_llm` plugin | Call may hang silently until LiveKit timeout |
 | Sarvam STT mid-call disconnect | No retry policy | User feels dead air |
 | TTS provider swap (Sarvam → ElevenLabs) | Only one provider runs per call; no A/B observability | Fallback path on plugin import failure works but no metrics |
@@ -234,9 +230,9 @@ silent-fail patterns in code.
 
 | # | Risk | Evidence |
 |---|---|---|
-| **D-11** | If `_env_login` succeeds while Postgres has tenants, session has `tenant_id="legacy"` | `ui_server.py:281` — `_tenant_uuid` returns `None` for "legacy", so all `/api/*` Postgres endpoints either fall through to legacy or return empty. Could mean dashboard shows nothing. |
+| **D-11** | Legacy env login could create non-tenant sessions | Fixed: env login removed; auth fails closed when PostgreSQL is unavailable. |
 | **D-12** | Admin endpoints `/api/admin/*` require `ADMIN_TOKEN` env | `_require_admin_token` — if token leaks or env unset, anyone can create tenants |
-| **D-13** | Session cookie `tenant_slug` in payload but `_validate_session_tenant` only checks `is_active` | `ui_server.py:364` — slug change in DB doesn't invalidate sessions |
+| **D-13** | Session cookie `tenant_slug` in payload must track DB tenant slug | Fixed: session validation rejects missing/inactive tenants and slug mismatches. |
 
 ### D.4 Async / streaming
 
@@ -253,7 +249,7 @@ silent-fail patterns in code.
 |---|---|---|
 | **D-18** | All three processes in one container — restarts kill voice + dashboard together | `supervisord.conf` |
 | **D-19** | No healthcheck for the agent process — supervisord only restarts on exit, not on hung worker | `supervisord.conf:6-16` |
-| **D-20** | Public dashboard exposes `/api/auth/_diag` after commit `3b40147` (NEW) — leaks expected_email in plain JSON | This was added by me for debugging; should be removed once login works |
+| **D-20** | Public dashboard diagnostic leaked auth metadata | Fixed: public `_diag` removed; runtime auth snapshot is internal-token protected. |
 
 ---
 
@@ -346,7 +342,7 @@ From `.env.example` (production must set these). Bold = required.
 | **Cal.com** | `CAL_API_KEY`, `CAL_EVENT_TYPE_ID` |
 | **S3 recording** | `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`, `S3_REGION` |
 | **SMS** | `FAST2SMS_API_KEY`, `FAST2SMS_SENDER_ID`, `FAST2SMS_ROUTE` |
-| **Auth (legacy)** | `DASHBOARD_EMAIL`, `DASHBOARD_PASSWORD`, `DASHBOARD_TENANT_SLUG`, `DASHBOARD_SESSION_SECRET` (or `SESSION_SECRET`) |
+| **Auth** | `SESSION_SECRET`, `INTERNAL_API_TOKEN`, optional `SESSION_COOKIE_DOMAIN` |
 | **Admin** | `ADMIN_TOKEN` (gates `/api/admin/*`) |
 | **Sentry** | `SENTRY_DSN` |
 | **Misc** | `ENVIRONMENT` (production gates), `LOG_LEVEL`, `N8N_WEBHOOK_URL` |

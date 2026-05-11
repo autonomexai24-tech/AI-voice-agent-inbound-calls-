@@ -26,9 +26,9 @@ Real deployment troubleshooting checklist for the current runtime.
 
 ## PostgreSQL Unavailable
 
-- Check `USE_POSTGRES`.
-- If `USE_POSTGRES=false`, PostgreSQL should show `disabled`.
-- If `USE_POSTGRES=true`, verify `DATABASE_URL`.
+- Check `USE_POSTGRES`; dashboard auth requires `true`.
+- Verify `DATABASE_URL` is present and points at the intended EasyPanel PostgreSQL database.
+- Query `/api/internal/runtime/auth` with `x-internal-token` and confirm `use_postgres=true`, `database_url_present=true`, and `postgres.postgres=ok`.
 - Confirm the database accepts connections from the VPS.
 - Add a short connection timeout to the connection string if startup is slow.
 
@@ -56,8 +56,8 @@ Real deployment troubleshooting checklist for the current runtime.
 ## Health Endpoint Degraded
 
 - Read every object under `checks`.
-- `postgres=disabled` is expected when `USE_POSTGRES=false`.
-- `postgres=uninitialized` is expected if `USE_POSTGRES=true` and the DB pool did not start.
+- `postgres=disabled` means auth, signup, and dashboard tenant APIs cannot run.
+- `postgres=uninitialized` means `USE_POSTGRES=true` but the DB pool did not start.
 - Missing core env vars must be fixed before staging validation.
 
 ## Transfer Failures

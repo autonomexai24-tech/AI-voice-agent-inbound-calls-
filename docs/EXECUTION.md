@@ -19,123 +19,58 @@
 
 ---
 
-## P0-A — AUTH DEBUGGING PLAN
+## P0-A — AUTH VALIDATION PLAN
 
-### A.1 Confirm what's deployed (commit `3b40147`)
+Dashboard auth is PostgreSQL-only. There is no env credential fallback and
+`/api/auth/_diag` has been removed.
 
-The fastest signal is the diagnostic endpoint added in commit `3b40147`:
+### A.1 Confirm what's deployed
 
+Use the internal runtime snapshot:
+
+```bash
+curl -s https://<easypanel-host>/api/internal/runtime/auth \
+  -H "x-internal-token: $INTERNAL_API_TOKEN" | jq
 ```
-GET https://<easypanel-host>/api/auth/_diag
-```
 
-Expected response:
+Expected:
+
 ```json
 {
-  "build_marker": "phase3a-credentials-fallback-v1",
   "use_postgres": true,
-  "fallback_active": {
-    "email_from": "code_default" | "env",
-    "password_from": "code_default" | "env",
-    "slug_from": "code_default" | "env"
-  },
-  "expected_email": "harshhavanur2005@gmail.com",
-  "expected_password_length": 17,
-  "expected_password_first2": "Ra",
-  "expected_password_last2": "21",
-  "expected_slug": "default"
+  "database_url_present": true,
+  "legacy_auth_env_present": [],
+  "postgres": {"postgres": "ok"}
 }
 ```
 
-### A.2 Decision tree based on `/_diag`
+`build_rev` must match the latest commit. If it does not, EasyPanel is serving
+an old build or stale container.
 
-| Diag response | Root cause | Fix |
-|---|---|---|
-| `404 Not Found` | EasyPanel build cache served old code | Force rebuild without cache (EasyPanel → Service → Settings → "Rebuild without cache") |
-| `password_from: "env"` AND `expected_password_length != 17` | Stale `DASHBOARD_PASSWORD` env var overriding code default | EasyPanel → Environment → delete `DASHBOARD_PASSWORD` and `ADMIN_PASSWORD` → restart |
-| `expected_password_length: 17` AND `_first2: "Ra"` AND login still 401 | Cookie domain mismatch (D-5) | See A.3 |
-| `use_postgres: true` AND a real user row exists with mismatched bcrypt | `_postgres_login` returns None, fallback should kick in | Verify with raw curl (A.4) |
-
-### A.3 Fix cookie domain on EasyPanel subdomain (D-5)
-
-`ui_server.py:337-350` does **not** set a cookie domain. On a host like
-`dhanushpackaging12.aivoice.ocznup.easypanel.host`, the browser scopes
-the cookie to that exact host. If the dashboard is later accessed via
-`aivoice.ocznup.easypanel.host` (without `dhanushpackaging12`), the
-cookie won't transmit.
-
-**Code change** in `_set_session_cookie`:
-
-```python
-def _set_session_cookie(response: Response, token: str) -> None:
-    secure = _is_production() or (os.environ.get("SESSION_COOKIE_SECURE") or "").lower() == "true"
-    samesite = (os.environ.get("SESSION_COOKIE_SAMESITE") or "lax").lower()
-    if samesite not in {"lax", "strict", "none"}:
-        samesite = "lax"
-    domain = os.environ.get("SESSION_COOKIE_DOMAIN") or None  # ← NEW
-    response.set_cookie(
-        SESSION_COOKIE,
-        token,
-        max_age=SESSION_TTL_SECONDS,
-        httponly=True,
-        secure=secure,
-        samesite=samesite,
-        path="/",
-        domain=domain,  # ← NEW
-    )
-```
-
-Mirror in `_clear_session_cookie`. Set `SESSION_COOKIE_DOMAIN` to the
-actual host (or leave unset for default current-host scoping).
-
-### A.4 Direct curl verification
+### A.2 Direct curl verification
 
 Bypass the frontend entirely:
 
 ```bash
 curl -i -X POST https://<easypanel-host>/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"harshhavanur2005@gmail.com","password":"RapidX-Voice-7421","tenant_slug":"default"}'
+  -d '{"email":"harshhavanur2005@gmail.com","password":"<password>","tenant_slug":"<workspace-slug>"}'
 ```
 
 | Result | Meaning |
 |---|---|
-| `200 OK` + `Set-Cookie: rapid_session=...` | Backend works → frontend issue (cookie not stored / domain) |
-| `401 {"detail":"Invalid credentials"}` | `_authenticate()` returning None — old code or env override |
-| `409 {"detail":"Workspace is required..."}` | Postgres path raised AmbiguousTenantLogin (workspace empty in payload) |
-| `404` | Old code still deployed (no `/api/auth/login` route is impossible — would mean different routing) |
-| `502/504` | ui_server process dead — check supervisord |
+| `200 OK` + `Set-Cookie: rapid_session=...` | Backend auth works |
+| `400 Workspace is required...` | Frontend or curl payload omitted workspace |
+| `401 Invalid password.` | User exists in workspace, password mismatch |
+| `403 That email belongs to a different workspace.` | Use the slug created at signup |
+| `404 Workspace not found...` | Wrong slug or tenant was not provisioned in this database |
+| `503` | `USE_POSTGRES`, `DATABASE_URL`, or PostgreSQL pool is not healthy |
 
-### A.5 Remove `/api/auth/_diag` once login works (D-20)
+### A.3 Frontend middleware verification
 
-Diagnostic endpoint leaks `expected_email`. Delete the route after fix
-confirmed. Plan: leave it for one more debug cycle, then strip in same
-commit as the cookie domain fix.
-
-### A.6 Defense-in-depth: ensure `_env_login` is reachable even on Postgres errors
-
-Currently if `_postgres_login` raises an unexpected exception (not
-`AmbiguousTenantLogin`), the exception propagates and `_env_login`
-never runs. Looking at `_postgres_login`, the inner `try/except` catches
-generic `Exception` so this is unlikely — but make it explicit in
-`_authenticate`:
-
-```python
-def _authenticate(email: str, password: str, tenant_slug: str | None = None) -> dict | None:
-    try:
-        result = _postgres_login(email, password, tenant_slug)
-        if result is not None:
-            return result
-    except AmbiguousTenantLogin:
-        # bubble up — caller turns this into 409
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("auth.postgres_login_failed", extra={"error_type": type(exc).__name__})
-    return _env_login(email, password, tenant_slug)
-```
-
-This guarantees env-login runs whenever Postgres is unreachable. Single
-small change at `ui_server.py:334`.
+With a valid cookie, `/dashboard` should render. With a stale, expired, or
+tenant-mismatched cookie, `/dashboard` should redirect to `/login` because
+Next middleware calls `/api/auth/session` before allowing protected routes.
 
 ---
 
@@ -148,12 +83,15 @@ have 5 minutes of real production logs.** Commands in `TESTING.md` §3.
 
 For each turn, expect to see:
 ```
+latency.call_config          provider/model config at call start
 latency.stt_received        stt_received_at
 latency.stt                 duration_ms, audio_duration_ms
 latency.llm                 ttft_ms, duration_ms
 latency.tts                 ttfb_ms, duration_ms
 latency.silence_to_speech_estimate    latency_ms
 ```
+
+Turn-level latency events include `turn_count` for correlation.
 
 If `silence_to_speech_estimate > 1500ms`, identify which stage dominates.
 
@@ -362,10 +300,10 @@ threading.Thread(target=_start_health, daemon=True).start()
 Then EasyPanel's health probe hits `/health:8081` and restarts container
 if probe fails 3× in 30s.
 
-### D.3 Remove diagnostic endpoint (D-20)
+### D.3 Auth runtime snapshot (D-20)
 
-After login is fixed (P0-A), remove the `/api/auth/_diag` route
-(`ui_server.py:552-579`).
+The public `/api/auth/_diag` route is removed. Use
+`/api/internal/runtime/auth` with `x-internal-token` for deployment checks.
 
 ### D.4 Add `BUILD_REV` to `/health` response
 
@@ -516,12 +454,12 @@ Add a short comment to `backend/core/config_resolver.py` linking to
 
 | # | Commit | Files | Verifies |
 |---|---|---|---|
-| 1 | **fix(auth): add cookie domain support + safer authenticate fallback** | `ui_server.py:337-349, 334` | A.3, A.6 |
+| 1 | **fix(auth): PostgreSQL-only tenant auth** | `ui_server.py`, `frontend/middleware.ts` | A.1-A.3 |
 | 2 | **chore(deploy): add BUILD_REV to /health** | `Dockerfile`, `ui_server.py:797` | D.4 |
 | 3 | **fix(voice): allow long transcripts during agent speech** | `agent.py:801-803` | C.1 |
 | 4 | **perf(voice): bump min_endpointing_delay default to 0.2s** | `backend/core/config_resolver.py:32`, `config.json`, ui_server defaults | B.4 |
 | 5 | **fix(deploy): force layer rebust via BUILD_REV arg** | `Dockerfile` | D.1 |
-| 6 | **chore(auth): remove /api/auth/_diag** | `ui_server.py:552-579` | D.3 |
+| 6 | **chore(auth): internal runtime auth snapshot** | `ui_server.py` | D.3 |
 | 7 | **perf(tools): cache Cal.com slot lookups** | `calendar_tools.py`, `agent.py:240` | B.6 |
 | 8 | **feat(voice): VAD-based turn detection (opt-in via env)** | `agent.py:619-626` | C.2 |
 | 9 | **chore: add agent process /health endpoint** | `agent.py` | D.2 |

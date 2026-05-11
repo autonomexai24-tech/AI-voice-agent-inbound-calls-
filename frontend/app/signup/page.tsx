@@ -5,6 +5,11 @@ import { Suspense } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { postJson } from "@/lib/api";
+import type { User } from "@/lib/types";
+
+function workspaceSlugPreview(company: string) {
+  return company.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
 
 function SignupForm() {
   const router = useRouter();
@@ -16,6 +21,7 @@ function SignupForm() {
   const [confirmPassword, setConfirmPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const previewSlug = workspaceSlugPreview(company);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -32,14 +38,17 @@ function SignupForm() {
 
     setLoading(true);
     try {
-      await postJson("/api/auth/signup", {
+      const result = await postJson<{ user: User }>("/api/auth/signup", {
         name: name.trim(),
         company: company.trim(),
         phone_number: phone.trim(),
         email: email.trim().toLowerCase(),
         password,
       });
-      router.replace("/dashboard");
+      if (result.user.tenant_slug) {
+        window.localStorage.setItem("rapid_workspace_slug", result.user.tenant_slug);
+      }
+      router.replace("/dashboard?signup=1");
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Signup failed");
@@ -69,6 +78,11 @@ function SignupForm() {
               minLength={2}
               className="focus-ring mt-2 min-h-11 w-full rounded-md border border-line px-3 text-sm shadow-sm"
             />
+            {previewSlug ? (
+              <span className="mt-1 block text-xs text-slate-500">
+                Workspace slug: <span className="font-semibold text-slate-700">{previewSlug}</span>
+              </span>
+            ) : null}
           </label>
           <label className="block">
             <span className="text-sm font-medium text-slate-700">Company name</span>

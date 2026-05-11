@@ -26,10 +26,21 @@ Use EasyPanel environment variables. Do not paste secrets into docs, screenshots
 
 | Variable | Status | Notes |
 |---|---|---|
-| `USE_POSTGRES` | Required mode flag | Set `false` for legacy fallback mode; set `true` for PostgreSQL coexistence validation. |
-| `DATABASE_URL` | Required when `USE_POSTGRES=true` | Add a short connection timeout in the URL if supported by the provider. |
+| `USE_POSTGRES` | Required | Must be `true` for dashboard auth, tenant config, and signup. No dashboard auth fallback exists. |
+| `DATABASE_URL` | Required | PostgreSQL is the single source of truth for tenants, users, and dashboard sessions. Add a short connection timeout in the URL if supported by the provider. |
 | `POSTGRES_POOL_MIN` | Optional | Defaults to `1`. |
 | `POSTGRES_POOL_MAX` | Optional | Defaults to `10`. |
+
+## Dashboard Auth
+
+| Variable | Status | Notes |
+|---|---|---|
+| `SESSION_SECRET` | Required in production | Long random value used to sign `rapid_session` cookies. |
+| `INTERNAL_API_TOKEN` | Recommended | Required in production to query `/api/internal/runtime/auth`. |
+| `SESSION_COOKIE_DOMAIN` | Optional | Use only if EasyPanel routes require a shared cookie domain. |
+| `SESSION_COOKIE_SECURE` | Optional | Set `true` behind HTTPS if `ENVIRONMENT` is not `production`. |
+
+Remove stale `DASHBOARD_EMAIL`, `DASHBOARD_PASSWORD`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, and `DASHBOARD_TENANT_*` variables from EasyPanel. They are no longer used for login and `/api/internal/runtime/auth` reports their names if they are still present.
 
 ## Vobiz
 

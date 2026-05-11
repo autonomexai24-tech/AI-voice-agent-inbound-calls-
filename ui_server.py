@@ -59,29 +59,30 @@ async def api_rate_limit_middleware(request: Request, call_next):
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     return await call_next(request)
 
-CONFIG_FILE = "config.json"
 SESSION_COOKIE = "rapid_session"
 SESSION_TTL_SECONDS = 60 * 60 * 12
 _RATE_LIMITS: dict[str, list[float]] = {}
 _RATE_LIMIT_LOCK = threading.Lock()
-PUBLIC_CONFIG_KEYS = {
-    "first_line",
-    "agent_instructions",
-    "stt_min_endpointing_delay",
-    "llm_model",
-    "tts_voice",
-    "tts_language",
-    "lang_preset",
-    "business_name",
-    "business_phone",
-    "business_hours_json",
-    "transfer_number",
-    "cal_event_type_id",
-}
 
 
-class AmbiguousTenantLogin(Exception):
-    """Raised when an email exists in multiple tenants and no workspace is supplied."""
+class AuthError(Exception):
+    """Authentication failure with a stable reason for logs and UI copy."""
+
+    def __init__(
+        self,
+        reason: str,
+        detail: str,
+        *,
+        status_code: int = 401,
+        tenant_slug: str | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
+        self.status_code = status_code
+        self.tenant_slug = tenant_slug
+        self.error_type = error_type
 
 
 def _is_production() -> bool:
@@ -125,42 +126,6 @@ def _validate_api_security_env() -> None:
     if _session_secret().decode("utf-8") == "dev-session-secret":
         raise RuntimeError("SESSION_SECRET or DASHBOARD_SESSION_SECRET must be set in production")
 
-def read_config():
-    config = {}
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-                config = raw if isinstance(raw, dict) else {}
-        except Exception as exc:
-            logger.warning("config.read_failed", extra={"error_type": type(exc).__name__})
-            config = {}
-    config = {k: v for k, v in config.items() if k in PUBLIC_CONFIG_KEYS}
-
-    def get_val(key, env_key, default=""):
-        return config.get(key) if config.get(key) else os.getenv(env_key, default)
-
-    return {
-        "first_line": get_val("first_line", "FIRST_LINE", "Namaste! This is Aryan from RapidX AI — we help businesses automate with AI. Hmm, may I ask what kind of business you run?"),
-        "agent_instructions": get_val("agent_instructions", "AGENT_INSTRUCTIONS", ""),
-        "stt_min_endpointing_delay": float(get_val("stt_min_endpointing_delay", "STT_MIN_ENDPOINTING_DELAY", 0.6)),
-        "llm_model": get_val("llm_model", "LLM_MODEL", "gpt-4o-mini"),
-        "tts_voice": get_val("tts_voice", "TTS_VOICE", "kavya"),
-        "tts_language": get_val("tts_language", "TTS_LANGUAGE", "hi-IN"),
-        "sip_trunk_id": get_val("sip_trunk_id", "SIP_TRUNK_ID", ""),
-        "cal_event_type_id": get_val("cal_event_type_id", "CAL_EVENT_TYPE_ID", ""),
-        **config
-    }
-
-def write_config(data):
-    if _is_production():
-        raise HTTPException(status_code=503, detail="File-backed config is disabled in production")
-    updates = {k: v for k, v in data.items() if k in PUBLIC_CONFIG_KEYS}
-    config = {k: v for k, v in read_config().items() if k in PUBLIC_CONFIG_KEYS}
-    config.update(updates)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=4)
-
 def _session_secret() -> bytes:
     secret = (
         os.environ.get("SESSION_SECRET")
@@ -185,15 +150,32 @@ def _create_session(user: dict) -> str:
         "email": user["email"],
         "tenant_id": user["tenant_id"],
         "tenant_name": user.get("tenant_name") or "RapidX AI",
-        "tenant_slug": user.get("tenant_slug") or "default",
+        "tenant_slug": user.get("tenant_slug") or "",
         "tenant_phone": user.get("tenant_phone") or "",
         "exp": int(time.time()) + SESSION_TTL_SECONDS,
     }
     encoded = _b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     return f"{encoded}.{_sign_session(encoded)}"
 
-def _read_session(request: Request) -> dict | None:
-    raw = request.cookies.get(SESSION_COOKIE)
+def _read_session_token(raw: str | None) -> tuple[dict | None, str | None]:
+    if not raw or "." not in raw:
+        return None, "missing_cookie" if not raw else "malformed_cookie"
+    payload, signature = raw.rsplit(".", 1)
+    if not hmac.compare_digest(_sign_session(payload), signature):
+        return None, "bad_signature"
+    try:
+        data = json.loads(_b64decode(payload))
+    except Exception:
+        return None, "invalid_payload"
+    try:
+        expires_at = int(data.get("exp", 0))
+    except (TypeError, ValueError):
+        return None, "invalid_payload"
+    if expires_at < int(time.time()):
+        return None, "expired"
+    return data, None
+
+def _read_session_context(raw: str | None) -> dict | None:
     if not raw or "." not in raw:
         return None
     payload, signature = raw.rsplit(".", 1)
@@ -203,13 +185,28 @@ def _read_session(request: Request) -> dict | None:
         data = json.loads(_b64decode(payload))
     except Exception:
         return None
-    if int(data.get("exp", 0)) < int(time.time()):
-        return None
-    return data
+    return data if isinstance(data, dict) else None
+
+def _read_session(request: Request) -> dict | None:
+    session, _reason = _read_session_token(request.cookies.get(SESSION_COOKIE))
+    return session
+
+def _log_session_validation_failure(reason: str, session: dict | None = None, *, status_code: int = 401) -> None:
+    logger.warning(
+        "auth.session_validation_failed",
+        extra={
+            "reason": reason,
+            "status_code": status_code,
+            "tenant_id": (session or {}).get("tenant_id"),
+            "tenant_slug": (session or {}).get("tenant_slug"),
+        },
+    )
 
 def require_session(request: Request) -> dict:
-    session = _read_session(request)
+    raw_session = request.cookies.get(SESSION_COOKIE)
+    session, reason = _read_session_token(raw_session)
     if not session:
+        _log_session_validation_failure(reason or "unknown", _read_session_context(raw_session))
         raise HTTPException(status_code=401, detail="Authentication required")
     _validate_session_tenant(session)
     set_correlation_context(tenant_id=str(session.get("tenant_id") or ""))
@@ -253,50 +250,20 @@ def _verify_password(password: str, stored_hash: str) -> bool:
             return False
     return False
 
-# Baked-in fallback dashboard credentials. Override in production by
-# setting DASHBOARD_EMAIL / DASHBOARD_PASSWORD env vars on EasyPanel.
-# Intentionally simple to eliminate typing errors during onboarding.
-_DEFAULT_DASHBOARD_EMAIL_CONST = "harshhavanur2005@gmail.com"
-_DEFAULT_DASHBOARD_PASSWORD_CONST = "admin123"
-_DEFAULT_DASHBOARD_SLUG_CONST = "default"
-
-
-def _env_login(email: str, password: str, tenant_slug: str | None = None) -> dict | None:
-    _DEFAULT_DASHBOARD_EMAIL = _DEFAULT_DASHBOARD_EMAIL_CONST
-    _DEFAULT_DASHBOARD_PASSWORD = _DEFAULT_DASHBOARD_PASSWORD_CONST
-    _DEFAULT_DASHBOARD_SLUG = _DEFAULT_DASHBOARD_SLUG_CONST
-    expected_email = (
-        os.environ.get("DASHBOARD_EMAIL")
-        or os.environ.get("ADMIN_EMAIL")
-        or _DEFAULT_DASHBOARD_EMAIL
-    )
-    expected_password = (
-        os.environ.get("DASHBOARD_PASSWORD")
-        or os.environ.get("ADMIN_PASSWORD")
-        or _DEFAULT_DASHBOARD_PASSWORD
-    )
-    expected_slug = os.environ.get("DASHBOARD_TENANT_SLUG") or _DEFAULT_DASHBOARD_SLUG
-    if not expected_email or not expected_password:
-        return None
-    if tenant_slug and tenant_slug.strip().lower() != expected_slug.strip().lower():
-        return None
-    if not hmac.compare_digest(email.strip().lower(), expected_email.strip().lower()):
-        return None
-    if not hmac.compare_digest(password, expected_password):
-        return None
-    return {
-        "email": expected_email,
-        "tenant_id": os.environ.get("DASHBOARD_TENANT_ID") or os.environ.get("TENANT_ID") or "legacy",
-        "tenant_name": os.environ.get("DASHBOARD_TENANT_NAME") or "RapidX AI",
-        "tenant_slug": expected_slug,
-        "tenant_phone": os.environ.get("DASHBOARD_TENANT_PHONE") or os.environ.get("DASHBOARD_BUSINESS_PHONE") or "",
-    }
-
 def _postgres_login(email: str, password: str, tenant_slug: str | None = None) -> dict | None:
     if not is_postgres_enabled():
-        return None
-    if not tenant_slug:
-        raise AmbiguousTenantLogin()
+        raise AuthError(
+            "postgres_disabled",
+            "Authentication requires PostgreSQL. Set USE_POSTGRES=true and DATABASE_URL.",
+            status_code=503,
+        )
+    workspace = (tenant_slug or "").strip().lower()
+    if not workspace:
+        raise AuthError(
+            "missing_workspace",
+            "Workspace is required. Use the workspace slug from signup.",
+            status_code=400,
+        )
     try:
         with get_connection() as conn:
             with conn.cursor() as cur:
@@ -305,14 +272,25 @@ def _postgres_login(email: str, password: str, tenant_slug: str | None = None) -
                     SELECT id, name, slug, phone_number, is_active
                     FROM tenants
                     WHERE lower(slug) = lower(%s)
-                      AND is_active = TRUE
                     LIMIT 1
                     """,
-                    (tenant_slug.strip(),),
+                    (workspace,),
                 )
                 tenant = cur.fetchone()
                 if tenant is None:
-                    return None
+                    raise AuthError(
+                        "workspace_not_found",
+                        "Workspace not found. Check your workspace slug.",
+                        status_code=404,
+                        tenant_slug=workspace,
+                    )
+                if not bool(tenant[4]):
+                    raise AuthError(
+                        "workspace_inactive",
+                        "Workspace is inactive. Contact support.",
+                        status_code=403,
+                        tenant_slug=tenant[2],
+                    )
                 cur.execute(
                     """
                     SELECT email, password_hash, tenant_id
@@ -324,13 +302,57 @@ def _postgres_login(email: str, password: str, tenant_slug: str | None = None) -
                     (str(tenant[0]), email.strip()),
                 )
                 row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        """
+                        SELECT t.slug
+                        FROM users u
+                        JOIN tenants t ON t.id = u.tenant_id
+                        WHERE lower(u.email) = lower(%s)
+                          AND lower(t.slug) <> lower(%s)
+                          AND t.is_active = TRUE
+                        LIMIT 1
+                        """,
+                        (email.strip(), workspace),
+                    )
+                    other_workspace = cur.fetchone()
+                    if other_workspace:
+                        raise AuthError(
+                            "wrong_workspace",
+                            "That email belongs to a different workspace.",
+                            status_code=403,
+                            tenant_slug=tenant[2],
+                        )
+                    raise AuthError(
+                        "account_not_found",
+                        "No account found for that email in this workspace.",
+                        status_code=404,
+                        tenant_slug=tenant[2],
+                    )
+    except AuthError:
+        raise
     except Exception as exc:
-        logger.warning("Auth postgres lookup failed: %s", type(exc).__name__)
-        return None
+        raise AuthError(
+            "postgres_unavailable",
+            "Authentication database unavailable. Please try again shortly.",
+            status_code=503,
+            tenant_slug=workspace,
+            error_type=type(exc).__name__,
+        ) from exc
     if not row:
-        return None
+        raise AuthError(
+            "account_not_found",
+            "No account found for that email in this workspace.",
+            status_code=404,
+            tenant_slug=tenant[2],
+        )
     if not _verify_password(password, row[1]):
-        return None
+        raise AuthError(
+            "invalid_password",
+            "Invalid password.",
+            status_code=401,
+            tenant_slug=tenant[2],
+        )
     return {
         "email": row[0],
         "tenant_id": str(row[2]),
@@ -340,17 +362,19 @@ def _postgres_login(email: str, password: str, tenant_slug: str | None = None) -
     }
 
 def _authenticate(email: str, password: str, tenant_slug: str | None = None) -> dict | None:
-    """Postgres-first, env-default-fallback. Postgres errors must never block env login."""
-    try:
-        result = _postgres_login(email, password, tenant_slug)
-        if result is not None:
-            return result
-    except AmbiguousTenantLogin:
-        # bubble up — handler turns this into 409 Workspace required
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("auth.postgres_login_failed", extra={"error_type": type(exc).__name__})
-    return _env_login(email, password, tenant_slug)
+    """Authenticate against PostgreSQL only."""
+    return _postgres_login(email, password, tenant_slug)
+
+def _log_auth_failure(error: AuthError, *, tenant_slug: str | None = None) -> None:
+    logger.warning(
+        "auth.login_failed",
+        extra={
+            "reason": error.reason,
+            "status_code": error.status_code,
+            "tenant_slug": error.tenant_slug or tenant_slug,
+            "error_type": error.error_type,
+        },
+    )
 
 def _session_cookie_kwargs() -> dict:
     """Cookie attribute set used by both set/clear; honors SESSION_COOKIE_DOMAIN env."""
@@ -388,7 +412,7 @@ def _clear_session_cookie(response: Response) -> None:
 
 def _tenant_uuid(session: dict) -> UUID | None:
     tenant_id = session.get("tenant_id")
-    if not tenant_id or tenant_id == "legacy":
+    if not tenant_id:
         return None
     try:
         return UUID(str(tenant_id))
@@ -397,17 +421,31 @@ def _tenant_uuid(session: dict) -> UUID | None:
 
 def _validate_session_tenant(session: dict) -> None:
     tenant_id = _tenant_uuid(session)
-    if not tenant_id or not is_postgres_enabled():
-        return
+    if not is_postgres_enabled():
+        _log_session_validation_failure("postgres_disabled", session, status_code=503)
+        raise HTTPException(status_code=503, detail="Session validation requires PostgreSQL")
+    if not tenant_id:
+        _log_session_validation_failure("invalid_tenant_id", session)
+        raise HTTPException(status_code=401, detail="Invalid session")
     try:
         from backend.db.tenants import get_tenant_by_id
 
         tenant = get_tenant_by_id(tenant_id)
     except Exception as exc:
-        logger.warning("Session tenant validation failed: %s", type(exc).__name__)
+        _log_session_validation_failure("postgres_unavailable", session, status_code=503)
+        logger.warning("auth.session_tenant_lookup_failed", extra={"error_type": type(exc).__name__})
         raise HTTPException(status_code=503, detail="Tenant validation unavailable")
-    if not tenant or not tenant.get("is_active", True):
+    if not tenant:
+        _log_session_validation_failure("tenant_missing", session)
+        raise HTTPException(status_code=401, detail="Tenant no longer exists")
+    if not tenant.get("is_active", True):
+        _log_session_validation_failure("tenant_inactive", session)
         raise HTTPException(status_code=401, detail="Tenant is not active")
+    session_slug = str(session.get("tenant_slug") or "").strip().lower()
+    tenant_slug = str(tenant.get("slug") or "").strip().lower()
+    if not session_slug or session_slug != tenant_slug:
+        _log_session_validation_failure("tenant_slug_mismatch", session)
+        raise HTTPException(status_code=401, detail="Workspace session is no longer valid")
 
 def _user_for_response(session: dict) -> dict:
     user = dict(session)
@@ -425,17 +463,6 @@ def _user_for_response(session: dict) -> dict:
         except Exception as exc:
             logger.warning("Session tenant refresh failed: %s", type(exc).__name__)
     return user
-
-def _safe_config(config: dict) -> dict:
-    return {k: v for k, v in config.items() if k in PUBLIC_CONFIG_KEYS}
-
-def _legacy_config_for_response() -> dict:
-    cfg = _safe_config(read_config())
-    cfg.setdefault("business_name", os.environ.get("DASHBOARD_TENANT_NAME") or "RapidX AI")
-    cfg.setdefault("business_phone", "")
-    cfg.setdefault("transfer_number", os.environ.get("DEFAULT_TRANSFER_NUMBER", ""))
-    cfg.setdefault("business_hours_json", "")
-    return cfg
 
 def _postgres_config_for_response(session: dict) -> dict | None:
     tenant_id = _tenant_uuid(session)
@@ -571,10 +598,13 @@ async def api_auth_login(request: Request, response: Response):
     _assert_rate_limit(request, "login", discriminator=email, limit=8, window_seconds=300)
     try:
         user = _authenticate(email, password, tenant_slug)
-    except AmbiguousTenantLogin:
-        raise HTTPException(status_code=409, detail="Workspace is required for this email")
-    if user is None:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    except AuthError as exc:
+        _log_auth_failure(exc, tenant_slug=tenant_slug)
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    logger.info(
+        "auth.login_success",
+        extra={"tenant_id": user.get("tenant_id"), "tenant_slug": user.get("tenant_slug")},
+    )
     _set_session_cookie(response, _create_session(user))
     return {"user": {k: user.get(k, "") for k in ("email", "tenant_id", "tenant_name", "tenant_slug", "tenant_phone")}}
 
@@ -593,6 +623,7 @@ async def api_auth_signup(request: Request, response: Response):
     Rate-limited to 3 attempts per IP per hour.
     """
     if not is_postgres_enabled():
+        logger.warning("signup.failed", extra={"reason": "postgres_disabled"})
         raise HTTPException(
             status_code=503,
             detail="Account signup requires PostgreSQL. Contact support.",
@@ -647,41 +678,51 @@ async def api_auth_signup(request: Request, response: Response):
     }
     _set_session_cookie(response, _create_session(user_payload))
     logger.info("signup.success", extra={"tenant_id": str(tenant["id"]), "tenant_slug": tenant["slug"]})
+    logger.info("auth.login_success", extra={"tenant_id": str(tenant["id"]), "tenant_slug": tenant["slug"], "reason": "signup_auto_login"})
     return {"user": user_payload}
-
-@app.get("/api/auth/_diag")
-async def api_auth_diag():
-    """Diagnostic: confirms which code is running. Safe — never exposes actual password values."""
-    expected_email = (
-        os.environ.get("DASHBOARD_EMAIL")
-        or os.environ.get("ADMIN_EMAIL")
-        or _DEFAULT_DASHBOARD_EMAIL_CONST
-    )
-    expected_password = (
-        os.environ.get("DASHBOARD_PASSWORD")
-        or os.environ.get("ADMIN_PASSWORD")
-        or _DEFAULT_DASHBOARD_PASSWORD_CONST
-    )
-    expected_slug = os.environ.get("DASHBOARD_TENANT_SLUG") or _DEFAULT_DASHBOARD_SLUG_CONST
-    return {
-        "build_marker": "phase3a-credentials-fallback-v1",
-        "build_rev": os.environ.get("BUILD_REV", "unknown"),
-        "use_postgres": is_postgres_enabled(),
-        "fallback_active": {
-            "email_from": "env" if (os.environ.get("DASHBOARD_EMAIL") or os.environ.get("ADMIN_EMAIL")) else "code_default",
-            "password_from": "env" if (os.environ.get("DASHBOARD_PASSWORD") or os.environ.get("ADMIN_PASSWORD")) else "code_default",
-            "slug_from": "env" if os.environ.get("DASHBOARD_TENANT_SLUG") else "code_default",
-        },
-        "expected_email": expected_email,
-        "expected_password_length": len(expected_password),
-        "expected_password_first2": expected_password[:2],
-        "expected_password_last2": expected_password[-2:],
-        "expected_slug": expected_slug,
-    }
 
 @app.get("/api/auth/me")
 async def api_auth_me(user: dict = Depends(require_session)):
     return {"user": _user_for_response(user)}
+
+@app.get("/api/auth/session")
+async def api_auth_session(user: dict = Depends(require_session)):
+    return {"ok": True, "user": _user_for_response(user)}
+
+@app.get("/api/internal/runtime/auth")
+async def api_internal_auth_runtime(request: Request):
+    _require_internal_access(request)
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    stale_auth_env = sorted(
+        name
+        for name in (
+            "DASHBOARD_EMAIL",
+            "DASHBOARD_PASSWORD",
+            "ADMIN_EMAIL",
+            "ADMIN_PASSWORD",
+            "DASHBOARD_TENANT_ID",
+            "DASHBOARD_TENANT_SLUG",
+            "DASHBOARD_TENANT_NAME",
+            "DASHBOARD_TENANT_PHONE",
+            "DASHBOARD_BUSINESS_PHONE",
+        )
+        if os.environ.get(name)
+    )
+    try:
+        from backend.db.connection import healthcheck as postgres_healthcheck
+
+        postgres = postgres_healthcheck()
+    except Exception as exc:
+        postgres = {"postgres": "error", "detail": type(exc).__name__}
+    return {
+        "build_rev": os.environ.get("BUILD_REV", "unknown"),
+        "use_postgres": is_postgres_enabled(),
+        "database_url_present": bool(database_url),
+        "database_url_fingerprint": hashlib.sha256(database_url.encode("utf-8")).hexdigest()[:16] if database_url else "",
+        "api_base_url": os.environ.get("API_BASE_URL", ""),
+        "legacy_auth_env_present": stale_auth_env,
+        "postgres": postgres,
+    }
 
 @app.get("/api/admin/tenants")
 async def api_admin_list_tenants(request: Request):
@@ -752,14 +793,17 @@ async def api_admin_update_tenant(tenant_id: str, request: Request):
 
 @app.get("/api/config")
 async def api_get_config(user: dict = Depends(require_session)):
-    return jsonable_encoder(_postgres_config_for_response(user) or _legacy_config_for_response())
+    config = _postgres_config_for_response(user)
+    if config is None:
+        raise HTTPException(status_code=503, detail="Tenant config unavailable")
+    return jsonable_encoder(config)
 
 @app.post("/api/config")
 async def api_post_config(request: Request, user: dict = Depends(require_session)):
     data = await _json_body(request)
     if not _update_postgres_config(user, data):
-        write_config(data)
-    logger.info("Configuration updated via UI.")
+        raise HTTPException(status_code=503, detail="Tenant config update unavailable")
+    logger.info("Configuration updated via UI.", extra={"tenant_id": user.get("tenant_id"), "tenant_slug": user.get("tenant_slug")})
     return {"status": "success"}
 
 @app.get("/api/logs")

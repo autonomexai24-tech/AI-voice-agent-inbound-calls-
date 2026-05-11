@@ -7,32 +7,36 @@
 
 ## 1. AUTH TESTS
 
-### 1.1 Diagnostic endpoint (verify deployed code)
+### 1.1 Runtime auth snapshot (verify deployed code)
 
 ```bash
-curl -s https://<HOST>/api/auth/_diag | jq
+curl -s https://<HOST>/api/internal/runtime/auth \
+  -H "x-internal-token: $INTERNAL_API_TOKEN" | jq
 ```
 
-Expected fields when commit `3b40147` is live:
-- `build_marker == "phase3a-credentials-fallback-v1"`
-- `expected_password_length == 17`
-- `expected_password_first2 == "Ra"`, `expected_password_last2 == "21"`
-
-If 404 or different values → see `EXECUTION.md §A.2`.
+Expected:
+- `use_postgres == true`
+- `database_url_present == true`
+- `postgres.postgres == "ok"`
+- `legacy_auth_env_present == []`
+- `build_rev` matches the commit EasyPanel just built.
 
 ### 1.2 Direct login curl (bypasses frontend)
 
 ```bash
 curl -i -X POST https://<HOST>/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"harshhavanur2005@gmail.com","password":"RapidX-Voice-7421","tenant_slug":"default"}'
+  -d '{"email":"harshhavanur2005@gmail.com","password":"<password>","tenant_slug":"<workspace-slug>"}'
 ```
 
 | Status | Pass/Fail | Action |
 |---|---|---|
 | 200 + `Set-Cookie: rapid_session=` | ✅ pass | Frontend issue if browser still fails |
-| 401 `Invalid credentials` | ❌ | Old code or env override |
-| 409 `Workspace is required` | ⚠ | Add `tenant_slug` (already in payload) — Postgres path bug |
+| 400 `Workspace is required...` | ⚠ | Frontend did not send `tenant_slug` |
+| 401 `Invalid password.` | ⚠ | Password mismatch for this workspace |
+| 403 `That email belongs to a different workspace.` | ⚠ | Use the workspace slug shown after signup |
+| 404 `Workspace not found...` | ⚠ | Wrong workspace slug or stale deployment data |
+| 503 | ❌ | PostgreSQL auth is not available; check `USE_POSTGRES`, `DATABASE_URL`, and pool health |
 | 502/504 | ❌ | ui_server process dead |
 
 ### 1.3 Wrong password test
@@ -40,10 +44,10 @@ curl -i -X POST https://<HOST>/api/auth/login \
 ```bash
 curl -i -X POST https://<HOST>/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"harshhavanur2005@gmail.com","password":"wrong","tenant_slug":"default"}'
+  -d '{"email":"harshhavanur2005@gmail.com","password":"wrong","tenant_slug":"<workspace-slug>"}'
 ```
 
-Expected: `401 Invalid credentials`. Anything else is a bug.
+Expected: `401 Invalid password.` Anything else is a bug.
 
 ### 1.4 Missing workspace test (Postgres-enabled only)
 
@@ -54,8 +58,7 @@ curl -i -X POST https://<HOST>/api/auth/login \
 ```
 
 Expected:
-- `USE_POSTGRES=true` → `409 Workspace is required for this email`
-- `USE_POSTGRES=false` → `401 Invalid credentials`
+- `400 Workspace is required...`
 
 ### 1.5 Session cookie persistence
 
@@ -63,7 +66,7 @@ Expected:
 # Login and save cookies
 curl -c /tmp/cj.txt -X POST https://<HOST>/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"harshhavanur2005@gmail.com","password":"RapidX-Voice-7421","tenant_slug":"default"}'
+  -d '{"email":"harshhavanur2005@gmail.com","password":"<password>","tenant_slug":"<workspace-slug>"}'
 
 # Use saved cookie
 curl -b /tmp/cj.txt https://<HOST>/api/auth/me
@@ -86,7 +89,7 @@ curl -b /tmp/cj.txt https://<HOST>/api/auth/me
 for i in {1..10}; do
   curl -s -o /dev/null -w "%{http_code}\n" -X POST https://<HOST>/api/auth/login \
     -H "Content-Type: application/json" \
-    -d '{"email":"x@y.com","password":"bad","tenant_slug":"default"}'
+    -d '{"email":"x@y.com","password":"bad","tenant_slug":"<workspace-slug>"}'
 done
 ```
 
@@ -111,10 +114,15 @@ Place a real call to your Vobiz DID. Listen for:
 Then check container logs for one full set of metrics per turn:
 ```bash
 # In EasyPanel logs tab, filter by call_id and look for:
+grep '"latency.call_config"' /var/log/agent.log | tail -5
 grep '"latency.silence_to_speech_estimate"' /var/log/agent.log | tail -10
 grep '"latency.llm"' /var/log/agent.log | tail -10
 grep '"latency.tts"' /var/log/agent.log | tail -10
 ```
+
+Latency events should include `tenant_id`, `did`, and `turn_count` so each
+turn can be tied back to the provider/model configuration captured at call
+start.
 
 ### 2.2 Compute mean latency from logs
 
@@ -412,8 +420,8 @@ Expected: `agent`, `ui_server`, `frontend` all `RUNNING`.
 ```bash
 # From inside the container:
 curl -s http://127.0.0.1:8000/health
-curl -s http://127.0.0.1:3000/api/auth/_diag
-# The latter should return the same JSON as direct backend (verifies Next rewrite works)
+curl -s http://127.0.0.1:3000/api/internal/runtime/auth -H "x-internal-token: $INTERNAL_API_TOKEN"
+# The latter should return the same JSON through the Next rewrite.
 ```
 
 ### 7.4 EasyPanel public route
@@ -430,7 +438,7 @@ curl -s -o /dev/null -w "%{http_code}\n" https://<HOST>/health
 
 ## 8. REGRESSION CHECKLIST (run before each deploy)
 
-- [ ] `/api/auth/_diag` returns `build_marker` matching expected commit
+- [ ] `/api/internal/runtime/auth` returns `use_postgres: true`, `postgres: ok`, and expected `build_rev`
 - [ ] Direct curl login (`§1.2`) returns 200
 - [ ] Logged-in `/api/auth/me` returns user (`§1.5`)
 - [ ] `/health` returns `status: ok` (or `degraded` only if Postgres intentionally down)
@@ -451,7 +459,7 @@ If something is on fire in production:
 | Symptom | Quick fix |
 |---|---|
 | All calls fail to answer | EasyPanel → restart agent service |
-| Login works but dashboard empty | Check `USE_POSTGRES`; if true, verify `DATABASE_URL` reachable; if not, set `USE_POSTGRES=false` to fall back to JSON |
+| Login works but dashboard empty | Check `/api/internal/runtime/auth`, tenant config rows, and dashboard API logs for tenant-scoped query failures |
 | Latency suddenly spiked | Check OpenAI status; switch to Groq via dashboard config |
 | Booking failures | Check Cal.com API status; verify `CAL_API_KEY` |
 | Recording uploads failing | Check S3 endpoint reachability; calls still work, recordings just queue with `failed` status |
