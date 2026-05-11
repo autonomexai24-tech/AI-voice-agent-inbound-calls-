@@ -29,7 +29,7 @@ CONFIG_FILE = "config.json"
 _DEFAULT_CONFIG: dict[str, Any] = {
     "agent_instructions": "",
     "first_line": "Namaste, thanks for calling. How can I help you today?",
-    "stt_min_endpointing_delay": 0.05,
+    "stt_min_endpointing_delay": 0.2,
     "llm_model": "gpt-4o-mini",
     "llm_provider": "openai",
     "tts_voice": "kavya",

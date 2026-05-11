@@ -74,7 +74,7 @@ def get_live_config(phone_number: str | None = None):
 
     return {
         "agent_instructions":       config.get("agent_instructions", ""),
-        "stt_min_endpointing_delay":config.get("stt_min_endpointing_delay", 0.05),
+        "stt_min_endpointing_delay":config.get("stt_min_endpointing_delay", 0.2),
         "llm_model":                config.get("llm_model", "gpt-4o-mini"),
         "llm_provider":             config.get("llm_provider", "openai"),
         "tts_voice":                config.get("tts_voice", "kavya"),
@@ -441,7 +441,7 @@ async def entrypoint(ctx: JobContext):
             "fallback_reason": resolved_config.fallback_reason,
         },
     )
-    delay_setting = live_config.get("stt_min_endpointing_delay", 0.05)
+    delay_setting = live_config.get("stt_min_endpointing_delay", 0.2)
     llm_model     = live_config.get("llm_model", "gpt-4o-mini")
     llm_provider  = live_config.get("llm_provider", "openai")
     tts_voice     = live_config.get("tts_voice", "kavya")
@@ -798,11 +798,24 @@ async def entrypoint(ctx: JobContext):
         transcript = ev.user_transcript.strip()
         transcript_lower = transcript.lower().rstrip(".")
 
-        if agent_is_speaking:
-            logger.debug("[FILTER-ECHO] Dropped transcript echo", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked})
-            return
         if not transcript or len(transcript) < 3:
             return
+        if agent_is_speaking:
+            # Short utterance during agent speech is usually echo (TTS audio
+            # bleeding back into STT). Long utterances are real barge-in.
+            # Threshold tunable via INTERRUPT_MIN_CHARS (default 8).
+            interrupt_threshold = int(os.getenv("INTERRUPT_MIN_CHARS", "8"))
+            if len(transcript) < interrupt_threshold:
+                logger.debug(
+                    "[FILTER-ECHO] Dropped short transcript during agent speech",
+                    extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "len": len(transcript)},
+                )
+                return
+            logger.info(
+                "[FILTER-ECHO] Allowing long transcript as barge-in",
+                extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "len": len(transcript)},
+            )
+            # fall through — process as real interruption
         if transcript_lower in FILLER_WORDS:
             logger.debug("[FILTER-FILLER] Dropped filler transcript", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked})
             return
