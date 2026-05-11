@@ -7,7 +7,7 @@ import asyncio
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Any
 from dotenv import load_dotenv
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -34,7 +34,9 @@ from livekit.agents import (
 )
 from livekit.plugins import openai, sarvam, silero
 
-CONFIG_FILE = "config.json"
+SUPPORTED_SARVAM_LANGUAGES = {"en-IN", "hi-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN"}
+SAFE_FALLBACK_FIRST_LINE = "We are unable to load this number's configuration right now. Please call again later."
+LANGUAGE_SWITCH_MIN_CONFIDENCE_CHARS = 2
 
 # ── Rate limiting (#37) ───────────────────────────────────────────────────────
 _call_timestamps: dict = defaultdict(list)
@@ -50,42 +52,6 @@ def is_rate_limited(phone: str) -> bool:
         return True
     _call_timestamps[phone].append(now)
     return False
-
-
-# ── Config loader (#17 partial — per-client path awareness) ───────────────────
-def get_live_config(phone_number: str | None = None):
-    """Load config — tries per-client file first, then default config.json."""
-    config = {}
-    paths = []
-    if phone_number and phone_number != "unknown":
-        clean = phone_number.replace("+", "").replace(" ", "")
-        paths.append(f"configs/{clean}.json")
-    paths += ["configs/default.json", CONFIG_FILE]
-
-    for path in paths:
-        if os.path.exists(path):
-            try:
-                with open(path, "r") as f:
-                    config = json.load(f)
-                    logger.info(f"[CONFIG] Loaded: {path}")
-                    break
-            except Exception as e:
-                logger.error("[CONFIG] Failed to read", extra={"path": path, "error_type": type(e).__name__})
-
-    return {
-        "agent_instructions":       config.get("agent_instructions", ""),
-        "stt_min_endpointing_delay":config.get("stt_min_endpointing_delay", 0.2),
-        "llm_model":                config.get("llm_model", "gpt-4o-mini"),
-        "llm_provider":             config.get("llm_provider", "openai"),
-        "tts_voice":                config.get("tts_voice", "kavya"),
-        "tts_language":             config.get("tts_language", "hi-IN"),
-        "tts_provider":             config.get("tts_provider", "sarvam"),
-        "stt_provider":             config.get("stt_provider", "sarvam"),
-        "stt_language":             config.get("stt_language", "unknown"),
-        "lang_preset":              config.get("lang_preset", "multilingual"),
-        "max_turns":                config.get("max_turns", 25),
-        **config,
-    }
 
 
 # ── Token counter (#11) ───────────────────────────────────────────────────────
@@ -106,7 +72,7 @@ from calendar_tools import get_available_slots, create_booking, cancel_booking
 from backend.voice.language import LANGUAGE_PRESETS, get_language_instruction
 from backend.voice.prompts import get_ist_time_context
 from backend.voice.transfer import build_sip_transfer_uri
-from backend.core.config_resolver import resolve_runtime_config
+from backend.core.config_resolver import resolve_runtime_config_async
 from backend.core.startup import run_startup_checks
 from backend.db.call_logs import insert_call_log
 from backend.db.connection import is_postgres_enabled
@@ -326,12 +292,16 @@ class ReceptionistAssistant(Agent):
     async def on_enter(self):
         greeting = self._live_config.get(
             "first_line",
-            self._first_line or (
-                "Namaste, thanks for calling. How can I help you today?"
-            )
+            self._first_line or SAFE_FALLBACK_FIRST_LINE,
         )
-        await self.session.generate_reply(
-            instructions=f"Say exactly this phrase: '{greeting}'"
+        await self.session.say(greeting, allow_interruptions=True)
+        logger.info(
+            "[GREETING] Tenant greeting sent",
+            extra={
+                "call_id": self._agent_tools.call_id,
+                "tenant_id": self._agent_tools.tenant_id,
+                "did": self._agent_tools.did_masked,
+            },
         )
         if self._live_config.get("_terminate_after_first_line"):
             asyncio.create_task(self._end_after_first_line())
@@ -352,6 +322,11 @@ async def entrypoint(ctx: JobContext):
 
     # ── Connect ───────────────────────────────────────────────────────────
     await ctx.connect()
+    if not ctx.room.remote_participants:
+        try:
+            await asyncio.wait_for(ctx.wait_for_participant(), timeout=2.0)
+        except asyncio.TimeoutError:
+            logger.warning("[ROOM] No remote participant before config resolution", extra={"call_id": ctx.room.name})
     call_id = ctx.room.name
     set_correlation_context(call_id=call_id)
     logger.info("[ROOM] Connected", extra={"call_id": call_id})
@@ -359,35 +334,26 @@ async def entrypoint(ctx: JobContext):
     # ── Extract caller info ───────────────────────────────────────────────
     phone_number = None
     caller_name  = ""
-    caller_phone = "unknown"
 
     # Try metadata first (LiveKit dispatch metadata)
     metadata = ctx.job.metadata or ""
-    meta = {}
-    if metadata:
-        try:
-            meta = json.loads(metadata)
-            phone_number = meta.get("phone_number")
-        except Exception:
-            pass
+    meta = _parse_json_object(metadata)
+    room_meta = _parse_json_object(getattr(ctx.room, "metadata", "") or "")
 
     # Extract from SIP participants
-    for identity, participant in ctx.room.remote_participants.items():
-        # Name from caller ID (#32)
-        if participant.name and participant.name not in ("", "Caller", "Unknown"):
-            caller_name = participant.name
-            logger.info("[CALLER-ID] Name present from SIP", extra={"call_id": call_id})
-        if not phone_number:
-            attr = participant.attributes or {}
-            phone_number = attr.get("sip.phoneNumber") or attr.get("phoneNumber")
-        if not phone_number and "+" in identity:
-            import re as _re
-            m = _re.search(r"\+\d{7,15}", identity)
-            if m:
-                phone_number = m.group()
-
+    phone_number, caller_name = _extract_caller_info(ctx, meta, room_meta)
+    if caller_name:
+        logger.info("[CALLER-ID] Name present from SIP", extra={"call_id": call_id})
     caller_phone = phone_number or "unknown"
     dialed_did = _extract_dialed_did(ctx, meta)
+    _log_inbound_sip_metadata(
+        ctx,
+        job_metadata=metadata,
+        parsed_job_metadata=meta,
+        parsed_room_metadata=room_meta,
+        caller_phone=caller_phone,
+        dialed_did=dialed_did,
+    )
     if dialed_did:
         logger.info(
             "[TENANT] DID resolved for tenant lookup",
@@ -403,7 +369,7 @@ async def entrypoint(ctx: JobContext):
         return
 
     # ── Load config ───────────────────────────────────────────────────────
-    resolved_config = resolve_runtime_config(caller_phone=caller_phone, did=dialed_did)
+    resolved_config = await resolve_runtime_config_async(caller_phone=caller_phone, did=dialed_did)
     live_config   = resolved_config.config
     tenant_id     = resolved_config.tenant_id
     did_masked    = mask_phone(dialed_did) if dialed_did else None
@@ -419,7 +385,7 @@ async def entrypoint(ctx: JobContext):
         if resolved_config.fallback_reason == "tenant_not_configured":
             fallback_line = "This number is not configured. Please contact support."
         else:
-            fallback_line = "We are unable to load this number's configuration right now. Please call again later."
+            fallback_line = SAFE_FALLBACK_FIRST_LINE
         live_config["agent_instructions"] = (
             "This inbound call cannot be mapped to an active tenant configuration. "
             "Do not answer business questions. Say the configured fallback message once and end the call."
@@ -445,11 +411,29 @@ async def entrypoint(ctx: JobContext):
     llm_model     = live_config.get("llm_model", "gpt-4o-mini")
     llm_provider  = live_config.get("llm_provider", "openai")
     tts_voice     = live_config.get("tts_voice", "kavya")
-    tts_language  = live_config.get("tts_language", "hi-IN")
+    configured_language = _resolve_configured_language(live_config)
+    tts_language  = configured_language
     tts_provider  = live_config.get("tts_provider", "sarvam")
     stt_provider  = live_config.get("stt_provider", "sarvam")
-    stt_language  = live_config.get("stt_language", "unknown")  # auto-detect (#20)
+    stt_language  = _resolve_stt_language(live_config, configured_language)
     max_turns     = live_config.get("max_turns", 25)
+    live_config["language"] = configured_language
+    live_config["tts_language"] = tts_language
+    live_config["stt_language"] = stt_language
+    logger.info(
+        "tenant.runtime.loaded",
+        extra={
+            "call_id": call_id,
+            "tenant_id": tenant_id,
+            "tenant_name": live_config.get("_tenant_name"),
+            "tenant_slug": live_config.get("_tenant_slug"),
+            "did": did_masked,
+            "language": configured_language,
+            "llm_model": llm_model,
+            "voice": tts_voice,
+            "config_source": resolved_config.source,
+        },
+    )
     logger.info(
         "latency.call_config",
         extra={
@@ -557,7 +541,7 @@ async def entrypoint(ctx: JobContext):
             agent_stt = sarvam.STT(
                 language=stt_language,
                 model="saaras:v3",
-                mode="translate",
+                mode="transcribe",
                 flush_signal=True,
                 sample_rate=16000,
             )
@@ -565,11 +549,11 @@ async def entrypoint(ctx: JobContext):
         agent_stt = sarvam.STT(
             language=stt_language,      # "unknown" = auto-detect (#20)
             model="saaras:v3",
-            mode="translate",
+            mode="transcribe",
             flush_signal=True,
             sample_rate=16000,          # force 16kHz (#1)
         )
-        logger.info("[STT] Using Sarvam Saaras v3")
+        logger.info("[STT] Using Sarvam Saaras v3", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "language": stt_language})
 
     # ── Build TTS (#2 24kHz, #10 ElevenLabs) ────────────────────────────
     if tts_provider == "elevenlabs":
@@ -596,7 +580,10 @@ async def entrypoint(ctx: JobContext):
             speaker=tts_voice,
             speech_sample_rate=24000,          # force 24kHz (#2)
         )
-        logger.info(f"[TTS] Using Sarvam Bulbul v3 — voice: {tts_voice} lang: {tts_language}")
+        logger.info(
+            "[TTS] Using Sarvam Bulbul v3",
+            extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "voice": tts_voice, "language": tts_language},
+        )
 
     # ── Sentence chunker (keep responses short for voice) ─────────────────
     def before_tts_cb(agent_response: str) -> str:
@@ -607,6 +594,37 @@ async def entrypoint(ctx: JobContext):
     turn_count    = 0
     interrupt_count = 0  # (#30)
     last_user_speech_at: float | None = None
+    current_language = tts_language
+    language_switch_enabled = _language_switch_enabled(live_config)
+
+    def maybe_switch_language(candidate: Any, *, reason: str, transcript: str | None = None):
+        nonlocal current_language, stt_language, tts_language
+        if not language_switch_enabled:
+            return
+        detected_language = _normalize_detected_language(candidate, transcript=transcript)
+        if not detected_language or detected_language == current_language:
+            return
+        previous_language = current_language
+        current_language = detected_language
+        stt_language = detected_language
+        tts_language = detected_language
+        live_config["detected_language"] = detected_language
+        live_config["caller_language"] = detected_language
+        if stt_provider == "sarvam":
+            _switch_sarvam_stt_language(agent_stt, detected_language)
+        if tts_provider == "sarvam":
+            _switch_sarvam_tts_language(agent_tts, detected_language)
+        logger.info(
+            "language.switch",
+            extra={
+                "call_id": call_id,
+                "tenant_id": tenant_id,
+                "did": did_masked,
+                "from_language": previous_language,
+                "to_language": detected_language,
+                "reason": reason,
+            },
+        )
 
     # ── Build agent ───────────────────────────────────────────────────────
     agent = ReceptionistAssistant(
@@ -744,6 +762,7 @@ async def entrypoint(ctx: JobContext):
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(ev):
         if getattr(ev, "is_final", False):
+            maybe_switch_language(getattr(ev, "language", None), reason="stt_event")
             logger.info(
                 "latency.stt_received",
                 extra={
@@ -839,6 +858,8 @@ async def entrypoint(ctx: JobContext):
         if transcript_lower in FILLER_WORDS:
             logger.debug("[FILTER-FILLER] Dropped filler transcript", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked})
             return
+
+        maybe_switch_language(None, reason="transcript_script", transcript=transcript)
 
         # Real-time transcript stream
         asyncio.create_task(_log_transcript("user", transcript))
@@ -1123,41 +1144,392 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(unified_shutdown_hook)
 
 
-def _extract_dialed_did(ctx: JobContext, metadata: dict) -> str | None:
-    """Best-effort DID extraction for tenant lookup; fallback stays single-tenant."""
-    for key in ("did", "dialed_did", "dialed_number", "called_number", "to"):
-        value = metadata.get(key)
-        if value:
-            return _clean_did_value(value)
+_DID_METADATA_KEYS = (
+    "did",
+    "dialed_did",
+    "dialed_number",
+    "dialedNumber",
+    "called_number",
+    "calledNumber",
+    "destination_did",
+    "destination_number",
+    "destinationNumber",
+    "callee",
+    "to",
+    "sip.to",
+    "sip.toNumber",
+    "sip.calledNumber",
+    "sip.destinationNumber",
+    "sip.requestUri",
+    "sip.trunkPhoneNumber",
+    "sip.phoneNumber",
+)
 
-    room_metadata = getattr(ctx.room, "metadata", "") or ""
-    if room_metadata:
-        try:
-            room_meta = json.loads(room_metadata)
-            for key in ("did", "dialed_did", "dialed_number", "called_number", "to"):
-                value = room_meta.get(key)
-                if value:
-                    return _clean_did_value(value)
-        except Exception:
-            pass
+_CALLER_METADATA_KEYS = (
+    "caller_phone",
+    "caller_number",
+    "callerNumber",
+    "from_number",
+    "fromNumber",
+    "ani",
+    "from",
+    "sip.from",
+    "sip.fromNumber",
+    "sip.callerNumber",
+    "sip.callerPhoneNumber",
+    "sip.phoneNumber",
+    "phone_number",
+    "phoneNumber",
+)
+
+_LANGUAGE_ALIASES = {
+    "english": "en-IN",
+    "en": "en-IN",
+    "en-in": "en-IN",
+    "en_in": "en-IN",
+    "hindi": "hi-IN",
+    "hinglish": "hi-IN",
+    "hi": "hi-IN",
+    "hi-in": "hi-IN",
+    "hi_in": "hi-IN",
+    "tamil": "ta-IN",
+    "ta": "ta-IN",
+    "ta-in": "ta-IN",
+    "ta_in": "ta-IN",
+    "telugu": "te-IN",
+    "te": "te-IN",
+    "te-in": "te-IN",
+    "te_in": "te-IN",
+    "kannada": "kn-IN",
+    "kn": "kn-IN",
+    "kn-in": "kn-IN",
+    "kn_in": "kn-IN",
+    "malayalam": "ml-IN",
+    "ml": "ml-IN",
+    "ml-in": "ml-IN",
+    "ml_in": "ml-IN",
+}
+
+_HINDI_ROMAN_TOKENS = {
+    "namaste",
+    "namaskar",
+    "mujhe",
+    "mujko",
+    "aap",
+    "hai",
+    "haan",
+    "nahi",
+    "kal",
+    "aaj",
+    "parso",
+    "chahiye",
+    "karna",
+    "krna",
+    "booking",
+    "theek",
+}
+
+
+def _extract_dialed_did(ctx: JobContext, metadata: dict) -> str | None:
+    """Best-effort DID extraction for tenant lookup across LiveKit SIP shapes."""
+    room_meta = _parse_json_object(getattr(ctx.room, "metadata", "") or "")
+    for mapping in (metadata, room_meta):
+        did = _extract_phone_by_keys(mapping, _DID_METADATA_KEYS)
+        if did:
+            return did
+
+    for raw in (getattr(ctx.job, "metadata", "") or "", getattr(ctx.room, "metadata", "") or ""):
+        did = _extract_phone_near_did_label(raw)
+        if did:
+            return did
 
     for participant in ctx.room.remote_participants.values():
         attr = participant.attributes or {}
-        for key in (
-            "sip.to",
-            "sip.toNumber",
-            "sip.calledNumber",
-            "sip.requestUri",
-            "sip.trunkPhoneNumber",
-            "calledNumber",
-            "dialedNumber",
-            "to",
-        ):
-            value = attr.get(key)
-            if value:
-                return _clean_did_value(value)
+        did = _extract_phone_by_keys(attr, _DID_METADATA_KEYS)
+        if did:
+            return did
+        did = _extract_phone_by_key_hints(
+            attr,
+            include=("did", "dialed", "called", "callee", "destination", "to", "trunk"),
+            exclude=("from", "caller", "ani"),
+        )
+        if did:
+            return did
+
+    for participant in ctx.room.remote_participants.values():
+        identity_did = _extract_phone_near_did_label(getattr(participant, "identity", "") or "")
+        if identity_did:
+            return identity_did
+        identity_phone = _clean_did_value(getattr(participant, "identity", "") or "")
+        if identity_phone and re.search(r"\d{7,15}", identity_phone):
+            return identity_phone
 
     return None
+
+
+def _extract_caller_info(ctx: JobContext, metadata: dict, room_metadata: dict) -> tuple[str | None, str]:
+    caller_name = ""
+    caller_phone = _extract_phone_by_keys(metadata, _CALLER_METADATA_KEYS)
+    if not caller_phone:
+        caller_phone = _extract_phone_by_keys(room_metadata, _CALLER_METADATA_KEYS)
+
+    for identity, participant in ctx.room.remote_participants.items():
+        if participant.name and participant.name not in ("", "Caller", "Unknown"):
+            caller_name = participant.name
+        attr = participant.attributes or {}
+        if not caller_phone:
+            caller_phone = _extract_phone_by_keys(attr, _CALLER_METADATA_KEYS)
+        if not caller_phone:
+            caller_phone = _extract_phone_by_key_hints(
+                attr,
+                include=("from", "caller", "ani"),
+                exclude=("to", "called", "dialed", "destination", "trunk"),
+            )
+        if not caller_phone and "+" in identity:
+            match = re.search(r"\+\d{7,15}", identity)
+            if match:
+                caller_phone = match.group(0)
+
+    return caller_phone, caller_name
+
+
+def _log_inbound_sip_metadata(
+    ctx: JobContext,
+    *,
+    job_metadata: str,
+    parsed_job_metadata: dict,
+    parsed_room_metadata: dict,
+    caller_phone: str,
+    dialed_did: str | None,
+) -> None:
+    participants = []
+    sip_headers: dict[str, Any] = {}
+    for identity, participant in ctx.room.remote_participants.items():
+        attributes = dict(participant.attributes or {})
+        participants.append(
+            {
+                "identity": _redact_log_value(identity),
+                "name": _redact_log_value(participant.name or ""),
+                "attributes": _redact_log_value(attributes),
+            }
+        )
+        for key, value in attributes.items():
+            lowered = key.lower()
+            if lowered.startswith("sip.") or "header" in lowered:
+                sip_headers[key] = value
+
+    logger.info(
+        "sip.metadata.snapshot",
+        extra={
+            "call_id": ctx.room.name,
+            "job_metadata": _redact_log_value(parsed_job_metadata or job_metadata),
+            "room_name": ctx.room.name,
+            "room_metadata": _redact_log_value(parsed_room_metadata or getattr(ctx.room, "metadata", "") or ""),
+            "participants": participants,
+            "sip_headers": _redact_log_value(sip_headers),
+            "caller_number": mask_phone(caller_phone) if caller_phone != "unknown" else "unknown",
+            "destination_did": mask_phone(dialed_did) if dialed_did else None,
+        },
+    )
+
+
+def _parse_json_object(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    raw = str(value or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _extract_phone_by_keys(mapping: dict, keys: tuple[str, ...]) -> str | None:
+    if not isinstance(mapping, dict):
+        return None
+    for key in keys:
+        value = _deep_get(mapping, key)
+        did = _clean_did_value(value)
+        if did:
+            return did
+    return None
+
+
+def _extract_phone_by_key_hints(
+    mapping: dict,
+    *,
+    include: tuple[str, ...],
+    exclude: tuple[str, ...] = (),
+) -> str | None:
+    for key, value in _flatten_mapping(mapping).items():
+        lowered = key.lower()
+        if any(token in lowered for token in include) and not any(token in lowered for token in exclude):
+            phone = _clean_did_value(value)
+            if phone:
+                return phone
+    return None
+
+
+def _extract_phone_near_did_label(value: Any) -> str | None:
+    raw = str(value or "")
+    if not raw:
+        return None
+    pattern = re.compile(
+        r"(?i)(?:did|dialed|called|callee|destination|trunk|to)[^+0-9]{0,48}(\+?\d[\d\s().-]{6,}\d)"
+    )
+    match = pattern.search(raw)
+    return _clean_did_value(match.group(1)) if match else None
+
+
+def _deep_get(mapping: dict, key: str) -> Any:
+    if key in mapping:
+        return mapping[key]
+    current: Any = mapping
+    for part in key.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _flatten_mapping(mapping: Any, prefix: str = "") -> dict[str, Any]:
+    if not isinstance(mapping, dict):
+        return {}
+    flattened: dict[str, Any] = {}
+    for key, value in mapping.items():
+        joined = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            flattened.update(_flatten_mapping(value, joined))
+        else:
+            flattened[joined] = value
+    return flattened
+
+
+def _resolve_configured_language(config: dict) -> str:
+    direct_language = _normalize_language_code(config.get("language"), allow_auto=False)
+    if direct_language:
+        return direct_language
+
+    preset = str(config.get("lang_preset") or "").strip().lower()
+    if preset not in {"", "auto", "multilingual"}:
+        preset_language = _normalize_language_code(preset, allow_auto=False)
+        if preset_language:
+            return preset_language
+
+    tts_language = _normalize_language_code(config.get("tts_language"), allow_auto=False)
+    if tts_language:
+        return tts_language
+
+    return "hi-IN"
+
+
+def _resolve_stt_language(config: dict, configured_language: str) -> str:
+    explicit = config.get("stt_language")
+    explicit_language = _normalize_language_code(explicit, allow_auto=True)
+    if explicit_language and explicit_language != "unknown":
+        return explicit_language
+    if _language_switch_enabled(config):
+        return "unknown"
+    return configured_language
+
+
+def _language_switch_enabled(config: dict) -> bool:
+    preset = str(config.get("lang_preset") or "").strip().lower()
+    explicit = str(config.get("language_switching") or "").strip().lower()
+    return preset in {"", "auto", "multilingual"} or explicit in {"1", "true", "yes", "on"}
+
+
+def _normalize_language_code(value: Any, *, allow_auto: bool) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if allow_auto and lowered in {"auto", "unknown", "multilingual"}:
+        return "unknown"
+    if raw in SUPPORTED_SARVAM_LANGUAGES:
+        return raw
+    alias = _LANGUAGE_ALIASES.get(lowered)
+    if alias in SUPPORTED_SARVAM_LANGUAGES:
+        return alias
+    preset = LANGUAGE_PRESETS.get(lowered)
+    if preset:
+        preset_language = preset.get("tts_language")
+        return preset_language if preset_language in SUPPORTED_SARVAM_LANGUAGES else None
+    return None
+
+
+def _normalize_detected_language(candidate: Any, *, transcript: str | None = None) -> str | None:
+    language = _normalize_language_code(candidate, allow_auto=False)
+    if language:
+        return language
+    return _detect_language_from_text(transcript or "")
+
+
+def _detect_language_from_text(text: str) -> str | None:
+    if not text or len(text.strip()) < LANGUAGE_SWITCH_MIN_CONFIDENCE_CHARS:
+        return None
+    script_ranges = (
+        ("hi-IN", r"[\u0900-\u097F]"),
+        ("ta-IN", r"[\u0B80-\u0BFF]"),
+        ("te-IN", r"[\u0C00-\u0C7F]"),
+        ("kn-IN", r"[\u0C80-\u0CFF]"),
+        ("ml-IN", r"[\u0D00-\u0D7F]"),
+    )
+    for language, pattern in script_ranges:
+        if len(re.findall(pattern, text)) >= LANGUAGE_SWITCH_MIN_CONFIDENCE_CHARS:
+            return language
+
+    tokens = {token.strip(".,!?;:").lower() for token in text.split()}
+    if tokens & _HINDI_ROMAN_TOKENS:
+        return "hi-IN"
+    if re.search(r"[A-Za-z]", text):
+        return "en-IN"
+    return None
+
+
+def _switch_sarvam_stt_language(stt_obj: Any, language: str) -> None:
+    opts = getattr(stt_obj, "_opts", None)
+    if opts is None:
+        return
+    model = getattr(opts, "model", "saaras:v3")
+    mode = getattr(opts, "mode", "transcribe")
+    try:
+        opts.language = language
+        for stream in list(getattr(stt_obj, "_streams", []) or []):
+            update_options = getattr(stream, "update_options", None)
+            if callable(update_options):
+                update_options(language=language, model=model, mode=mode)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("language.switch.stt_failed", extra={"language": language, "error_type": type(exc).__name__})
+
+
+def _switch_sarvam_tts_language(tts_obj: Any, language: str) -> None:
+    opts = getattr(tts_obj, "_opts", None)
+    if opts is None:
+        return
+    try:
+        opts.target_language_code = language
+        for stream in list(getattr(tts_obj, "_streams", []) or []):
+            stream_opts = getattr(stream, "_opts", None)
+            if stream_opts is not None:
+                stream_opts.target_language_code = language
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("language.switch.tts_failed", extra={"language": language, "error_type": type(exc).__name__})
+
+
+def _redact_log_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _redact_log_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_log_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_log_value(item) for item in value)
+    if isinstance(value, str):
+        redacted = re.sub(r"\+?\d[\d\s().-]{6,}\d", lambda match: mask_phone(match.group(0)), value)
+        return redacted[:2000]
+    return value
 
 
 def _clean_did_value(value) -> str | None:

@@ -12,12 +12,15 @@ calls must fall back to the legacy config path if Postgres is unavailable.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass
 from typing import Any, Optional
+from uuid import UUID
 
 from backend.db.connection import is_postgres_enabled
+from backend.db import tenants as tenant_repo
 from backend.services.tenant_service import TenantNotConfiguredError, TenantService
 from backend.utils.formatting import mask_phone
 from backend.utils.logging import get_logger
@@ -28,7 +31,7 @@ CONFIG_FILE = "config.json"
 
 _DEFAULT_CONFIG: dict[str, Any] = {
     "agent_instructions": "",
-    "first_line": "Namaste, thanks for calling. How can I help you today?",
+    "first_line": "We are unable to load this number's configuration right now. Please call again later.",
     "stt_min_endpointing_delay": 0.2,
     "llm_model": "gpt-4o-mini",
     "llm_provider": "openai",
@@ -74,6 +77,56 @@ def resolve_runtime_config(
     if is_postgres_enabled():
         if did:
             resolved, fallback_reason = _try_postgres_config(did=did)
+            if resolved is not None:
+                return resolved
+            return _json_result(
+                dict(_DEFAULT_CONFIG),
+                "environment_defaults",
+                fallback_reason=fallback_reason or "postgres_unavailable_or_unconfigured",
+                did=did,
+            )
+
+        logger.info(
+            "config.source.selected",
+            extra={
+                "source": "environment_defaults",
+                "postgres_enabled": True,
+                "fallback_reason": "did_missing",
+            },
+        )
+        return _json_result(
+            dict(_DEFAULT_CONFIG),
+            "environment_defaults",
+            fallback_reason="did_missing",
+        )
+
+    json_config, json_source = _load_json_config(caller_phone)
+    logger.info(
+        "config.source.selected",
+        extra={"source": json_source, "postgres_enabled": False},
+    )
+    return _json_result(json_config, json_source)
+
+
+async def get_tenant_by_did(did: str) -> Optional[dict]:
+    """Resolve a tenant by inbound DID without blocking the event loop."""
+    return await asyncio.to_thread(tenant_repo.get_tenant_by_did, did)
+
+
+async def load_tenant_config(tenant_id: str) -> Optional[dict]:
+    """Load one tenant_config row without blocking the event loop."""
+    return await asyncio.to_thread(tenant_repo.get_tenant_config, UUID(str(tenant_id)))
+
+
+async def resolve_runtime_config_async(
+    *,
+    caller_phone: Optional[str] = None,
+    did: Optional[str] = None,
+) -> ResolvedRuntimeConfig:
+    """Async call-start config resolution for the LiveKit worker."""
+    if is_postgres_enabled():
+        if did:
+            resolved, fallback_reason = await _try_postgres_config_async(did=did)
             if resolved is not None:
                 return resolved
             return _json_result(
@@ -152,8 +205,60 @@ def _try_postgres_config(
         )
         return None, "postgres_error"
 
-    tenant = resolved["tenant"]
-    tenant_config = resolved["config"]
+    return _postgres_result_from_rows(
+        tenant=resolved["tenant"],
+        tenant_config=resolved["config"],
+        did=did,
+    ), None
+
+
+async def _try_postgres_config_async(
+    *,
+    did: str,
+) -> tuple[Optional[ResolvedRuntimeConfig], Optional[str]]:
+    try:
+        tenant = await get_tenant_by_did(did)
+        if tenant is None:
+            logger.warning(
+                "tenant.resolve.fallback",
+                extra={
+                    "did_masked": mask_phone(did),
+                    "fallback_reason": "tenant_not_configured",
+                },
+            )
+            return None, "tenant_not_configured"
+
+        tenant_config = await load_tenant_config(str(tenant["id"]))
+        if tenant_config is None:
+            logger.error(
+                "tenant.config.missing",
+                extra={"tenant_id": str(tenant["id"]), "did_masked": mask_phone(did)},
+            )
+            return None, "tenant_not_configured"
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "tenant.resolve.error",
+            extra={
+                "did_masked": mask_phone(did),
+                "fallback_reason": "postgres_error",
+                "error_type": type(exc).__name__,
+            },
+        )
+        return None, "postgres_error"
+
+    return _postgres_result_from_rows(
+        tenant=tenant,
+        tenant_config=tenant_config,
+        did=did,
+    ), None
+
+
+def _postgres_result_from_rows(
+    *,
+    tenant: dict[str, Any],
+    tenant_config: dict[str, Any],
+    did: str,
+) -> ResolvedRuntimeConfig:
     tenant_id = str(tenant["id"])
     merged = _merge_config({}, _normalize_tenant_config(tenant_config))
     merged["_tenant_id"] = tenant_id
@@ -180,7 +285,7 @@ def _try_postgres_config(
         source="postgres",
         tenant_id=tenant_id,
         did=did,
-    ), None
+    )
 
 
 def _load_json_config(phone_number: Optional[str]) -> tuple[dict[str, Any], str]:
