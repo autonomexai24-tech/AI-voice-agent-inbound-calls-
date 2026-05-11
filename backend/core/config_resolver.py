@@ -15,11 +15,9 @@ from backend.utils.logging import get_logger
 logger = get_logger("backend.core.config_resolver")
 
 
-SAFE_FALLBACK_FIRST_LINE = "We are unable to load this number's configuration right now. Please call again later."
-
 _DEFAULT_CONFIG: dict[str, Any] = {
     "agent_instructions": "",
-    "first_line": SAFE_FALLBACK_FIRST_LINE,
+    "first_line": "",
     "stt_min_endpointing_delay": 0.2,
     "llm_model": "gpt-4o-mini",
     "llm_provider": "openai",
@@ -97,7 +95,7 @@ def get_config_source_status() -> dict[str, Any]:
     return {
         "postgres_enabled": is_postgres_enabled(),
         "json_source": "disabled",
-        "effective_priority": ["tenants_table", "safe_fallback"],
+        "effective_priority": ["tenants_table", "abort_call"],
     }
 
 
@@ -114,7 +112,7 @@ def _result_from_tenant(tenant: Optional[dict], *, did: str) -> ResolvedRuntimeC
     config.update(
         {
             "agent_instructions": tenant.get("system_prompt") or tenant.get("agent_instructions") or "",
-            "first_line": tenant.get("welcome_message") or tenant.get("first_line") or SAFE_FALLBACK_FIRST_LINE,
+            "first_line": tenant.get("welcome_message") or tenant.get("first_line") or "",
             "tts_voice": tenant.get("voice") or tenant.get("tts_voice") or "kavya",
             "tts_language": tenant.get("tts_language") or "hi-IN",
             "stt_language": tenant.get("stt_language") or "unknown",
@@ -153,13 +151,13 @@ def _result_from_tenant(tenant: Optional[dict], *, did: str) -> ResolvedRuntimeC
 
 def _fallback_result(reason: str, *, did: Optional[str] = None) -> ResolvedRuntimeConfig:
     config = dict(_DEFAULT_CONFIG)
-    config["_config_source"] = "safe_fallback"
+    config["_config_source"] = "tenant_unavailable"
     config["_config_fallback_reason"] = reason
     if did:
         config["_did"] = did
     return ResolvedRuntimeConfig(
         config=config,
-        source="safe_fallback",
+        source="tenant_unavailable",
         did=did,
         fallback_reason=reason,
     )

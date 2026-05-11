@@ -92,15 +92,25 @@ def run_startup_checks(
         },
     )
 
-    # Pool init when enabled. Database failures are reported as degraded so
-    # live calls can still fail gracefully instead of crashing the process.
+    # Pool init when enabled. PostgreSQL is required for tenant runtime config,
+    # so any connection/schema/seed failure must stop the process.
     if initialize_postgres and is_postgres_enabled():
         try:
             init_pool()
+            log.info("postgres.connected", extra={"service": service_name})
             from backend.db.tenants import ensure_tenants_schema, seed_default_tenant_from_env
 
             ensure_tenants_schema()
-            seed_default_tenant_from_env()
+            log.info("schema.created", extra={"service": service_name, "schema": "tenants"})
+            seeded_tenant = seed_default_tenant_from_env()
+            log.info(
+                "tenant.seeded",
+                extra={
+                    "service": service_name,
+                    "tenant_id": str((seeded_tenant or {}).get("id") or ""),
+                    "tenant_name": (seeded_tenant or {}).get("name"),
+                },
+            )
             _record_startup_status(
                 status="ok",
                 service=service_name,
@@ -110,21 +120,21 @@ def run_startup_checks(
             )
             log.info("startup.postgres_initialized", extra={"service": service_name, "schema": "tenants"})
         except Exception as exc:  # noqa: BLE001
+            import traceback
+
+            print("\n========== POSTGRES STARTUP ERROR ==========")
+            print(str(exc))
+            traceback.print_exc()
+            print("===========================================\n")
+
             _record_startup_status(
-                status="degraded",
+                status="failed",
                 service=service_name,
                 postgres_enabled=True,
                 postgres_initialized=False,
-                last_error="postgres_unavailable",
+                last_error=str(exc),
             )
-            log.error(
-                "startup.postgres_unavailable",
-                extra={
-                    "service": service_name,
-                    "postgres_enabled": True,
-                    "error_type": type(exc).__name__,
-                },
-            )
+            raise
     else:
         _record_startup_status(
             status="ok",

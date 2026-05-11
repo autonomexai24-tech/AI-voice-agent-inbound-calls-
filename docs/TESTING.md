@@ -330,7 +330,7 @@ Place call to tenant A's DID, then to tenant B's DID. Check logs:
 
 ```
 [TENANT] DID resolved for tenant lookup    did_masked=...
-config.runtime.selected                    tenant_id=<A_id>, config_source=postgres
+config.runtime.selected                    tenant_id=<A_id>, config_source=postgres.tenants
 ```
 
 Then second call:
@@ -346,13 +346,21 @@ In Postgres: `UPDATE tenants SET is_active=FALSE WHERE id='<TID>';`
 
 Place a call to that tenant's DID.
 
-Expected: greeting says "This number is not configured. Please contact support." and call ends within 4 seconds (`agent.py:418-433`).
+Expected: no AgentSession starts, no default prompt is spoken, and logs include `tenant.runtime.missing_abort_call`.
 
-### 5.4 Unknown DID falls back
+### 5.4 Unknown DID aborts before AI startup
 
 Place a call from a number whose DID has no tenant row.
 
-Expected: same fallback as 5.3, log line `tenant.config.unavailable`.
+Expected: no AgentSession starts, no default prompt is spoken, and logs include `tenant.runtime.missing_abort_call`.
+
+### 5.5 Incomplete tenant config aborts before AI startup
+
+In Postgres: `UPDATE tenants SET welcome_message='' WHERE id='<TID>';`
+
+Place a call to that tenant's DID.
+
+Expected: no AgentSession starts, no default prompt is spoken, and logs include `tenant.runtime.incomplete_abort_call`.
 
 ---
 

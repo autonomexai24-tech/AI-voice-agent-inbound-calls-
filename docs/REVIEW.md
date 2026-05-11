@@ -80,7 +80,7 @@ PSTN caller  ─►  Vobiz SIP trunk  ─►  LiveKit room (auto-dispatch)
 - Resolution: DID (called number) → `tenants.phone_number` → prompt,
   greeting, language, and voice on the same row.
 - Voice runtime resolution: `backend/core/config_resolver.py`
-  (`resolve_runtime_config`) — `postgres.tenants` first, then safe fallback.
+  (`resolve_runtime_config`) — `postgres.tenants`; missing tenant aborts the call before any default prompt.
 - Active flag: `tenants.is_active`; agent refuses calls for inactive tenants
   (`agent.py:411-433`).
 
@@ -118,9 +118,8 @@ Subsequent requests:
   Postgres is **disabled** — see `agent.py:1019` (the dual-write switch).
 - **S3-compatible recording storage**: LiveKit egress → S3 directly via
   `S3StorageProvider` (`agent.py:651-684`).
-- **config.json** (file): legacy fallback when Postgres disabled. JSON
-  files in `configs/<phone>.json` and `configs/default.json` for per-DID
-  configs.
+- Tenant runtime config is loaded from PostgreSQL only. If a DID does not
+  resolve to `tenants.phone_number`, the live call aborts before AI startup.
 
 ---
 

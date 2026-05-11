@@ -75,8 +75,11 @@ def check_postgres_unavailable() -> dict:
     env = {key: "phase3c-dummy" for key in CRITICAL_ENV}
     env.update({"USE_POSTGRES": "true", "DATABASE_URL": None})
     with _patched_env(env):
-        run_startup_checks("phase3c-postgres-unavailable", strict_config=True)
-    return {"ok": True, "expected": "startup degrades without crashing"}
+        try:
+            run_startup_checks("phase3c-postgres-unavailable", strict_config=True)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": True, "expected": "startup fails fast", "error_type": type(exc).__name__}
+    return {"ok": False, "expected": "startup should fail fast when PostgreSQL is unavailable"}
 
 
 def check_invalid_did_metadata() -> dict:

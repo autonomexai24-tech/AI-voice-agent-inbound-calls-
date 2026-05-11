@@ -120,6 +120,29 @@ class AsyncRuntimeResolverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved.config["tts_language"], "ta-IN")
         self.assertEqual(resolved.config["llm_model"], "gpt-4o-mini")
 
+    async def test_async_resolver_does_not_invent_missing_tenant_greeting(self):
+        tenant = {
+            "id": TENANT_ID,
+            "name": "Autonomex AI",
+            "slug": "autonomex-ai",
+            "phone_number": "+917676808950",
+            "system_prompt": "Tenant prompt",
+            "welcome_message": "",
+            "voice": "kavya",
+            "languages": "multilingual",
+        }
+
+        with patch.object(config_resolver, "is_postgres_enabled", return_value=True), patch.object(
+            config_resolver, "get_tenant_by_did", new=AsyncMock(return_value=tenant)
+        ):
+            resolved = await config_resolver.resolve_runtime_config_async(
+                caller_phone="+919111111111",
+                did="+917676808950",
+            )
+
+        self.assertEqual(resolved.source, "postgres.tenants")
+        self.assertEqual(resolved.config["first_line"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

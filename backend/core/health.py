@@ -13,7 +13,6 @@ Design constraints (per RULES.md and EXECUTION.md):
 
 from __future__ import annotations
 
-import json
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -22,9 +21,6 @@ from backend.config.env import REQUIRED_CORE_ENV, get_env
 from backend.core.config_resolver import get_config_source_status
 from backend.core.startup import get_startup_status
 from backend.db.connection import healthcheck as postgres_healthcheck
-
-CONFIG_FILE = "config.json"
-
 
 def aggregate_health(service: str = "ai-receptionist") -> dict[str, Any]:
     """Return the full health payload for the /health endpoint.
@@ -82,13 +78,3 @@ def _process_status() -> dict[str, Any]:
         "status": "running",
         "pid": os.getpid(),
     }
-
-def _read_config_json() -> dict[str, Any]:
-    if not os.path.exists(CONFIG_FILE):
-        return {}
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}

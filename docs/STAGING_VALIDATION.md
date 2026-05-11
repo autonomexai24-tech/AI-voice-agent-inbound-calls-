@@ -186,16 +186,17 @@ Rollback action:
 
 Preconditions:
 
-```bash
-psql "$DATABASE_URL" -f migrations/001_initial.sql
-```
-
-Seed one `tenants` row with the staging DID, prompt, greeting, language, and voice.
+- `USE_POSTGRES=true`
+- `DATABASE_URL` points at the EasyPanel PostgreSQL service.
+- `DEFAULT_PHONE_NUMBER` is set to the inbound DID, such as `+917676808950`, `917676808950`, or `7676808950`.
+- `DEFAULT_BUSINESS_NAME`, `DEFAULT_SYSTEM_PROMPT`, and optionally `DEFAULT_WELCOME_MESSAGE`, `DEFAULT_LANGUAGES`, `DEFAULT_VOICE`, `DEFAULT_LLM_MODEL`, and `DEFAULT_ENDPOINTING_DELAY` are set for the seed tenant.
 
 Expected behavior:
 
 - Startup attempts pool initialization.
-- If DB is reachable, logs show `startup.postgres_initialized`.
+- If DB is reachable, logs show `postgres.connected`.
+- The app creates or upgrades the `tenants` table automatically and logs `tenants.schema.ready`.
+- The app seeds the default tenant and logs `tenants.seed.ready`.
 - DID resolves to tenant.
 - Config source log shows `config_source=postgres.tenants`.
 - Post-call call log dual-write completes when tenant is resolved.
@@ -205,7 +206,9 @@ Failure symptoms:
 
 - `tenant.resolve.error`.
 - `tenant.resolve.not_found`.
-- `config_source=safe_fallback` when DID should resolve.
+- `tenant.runtime.missing_abort_call` when DID should resolve.
+- `tenant.runtime.incomplete_abort_call` when the tenant row is missing a prompt or greeting.
+- `tenants.seed.failed` when `DEFAULT_PHONE_NUMBER` is missing.
 - Postgres call-log dual-write skipped.
 
 Rollback action:
@@ -235,7 +238,7 @@ Expected behavior:
 Failure symptoms:
 
 - Missing optional integrations crash startup.
-- Invalid DID raises instead of using the safe fallback.
+- Invalid DID starts an AgentSession instead of aborting before prompt/LLM/TTS.
 - SMS provider exception escapes.
 - Simulated Cal.com failure returns success.
 
@@ -469,6 +472,6 @@ Phase 3C staging validation passes only when:
 - Booking works.
 - `USE_POSTGRES=false` preserves old behavior.
 - `USE_POSTGRES=true` works with seeded tenant config.
-- Postgres failures degrade to config/Supabase fallback.
+- Postgres startup failures stop the process and print the startup traceback.
 - Latency logs appear without transcript or secret leakage.
 - EasyPanel deployment remains a single Supervisor-managed container.

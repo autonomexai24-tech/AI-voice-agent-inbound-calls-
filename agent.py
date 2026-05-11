@@ -35,7 +35,6 @@ from livekit.agents import (
 from livekit.plugins import openai, sarvam, silero
 
 SUPPORTED_SARVAM_LANGUAGES = {"en-IN", "hi-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN"}
-SAFE_FALLBACK_FIRST_LINE = "We are unable to load this number's configuration right now. Please call again later."
 LANGUAGE_SWITCH_MIN_CONFIDENCE_CHARS = 2
 
 # ── Rate limiting (#37) ───────────────────────────────────────────────────────
@@ -290,10 +289,17 @@ class ReceptionistAssistant(Agent):
         super().__init__(instructions=final_instructions, tools=tools)
 
     async def on_enter(self):
-        greeting = self._live_config.get(
-            "first_line",
-            self._first_line or SAFE_FALLBACK_FIRST_LINE,
-        )
+        greeting = self._live_config.get("first_line") or self._first_line
+        if not greeting:
+            logger.error(
+                "[GREETING] Missing tenant greeting",
+                extra={
+                    "call_id": self._agent_tools.call_id,
+                    "tenant_id": self._agent_tools.tenant_id,
+                    "did": self._agent_tools.did_masked,
+                },
+            )
+            return
         await self.session.say(greeting, allow_interruptions=True)
         logger.info(
             "[GREETING] Tenant greeting sent",
@@ -374,29 +380,6 @@ async def entrypoint(ctx: JobContext):
     tenant_id     = resolved_config.tenant_id
     did_masked    = mask_phone(dialed_did) if dialed_did else None
     set_correlation_context(call_id=call_id, tenant_id=str(tenant_id or ""), did=did_masked or "")
-    tenant_unavailable = (
-        is_postgres_enabled()
-        and not tenant_id
-        and resolved_config.fallback_reason
-        in {"tenant_not_found", "tenant_not_configured", "postgres_error", "did_missing", "postgres_unavailable_or_unconfigured"}
-    )
-    postgres_tenant_runtime = is_postgres_enabled() and (bool(tenant_id) or tenant_unavailable)
-    if tenant_unavailable:
-        if resolved_config.fallback_reason == "tenant_not_configured":
-            fallback_line = "This number is not configured. Please contact support."
-        else:
-            fallback_line = SAFE_FALLBACK_FIRST_LINE
-        live_config["agent_instructions"] = (
-            "This inbound call cannot be mapped to an active tenant configuration. "
-            "Do not answer business questions. Say the configured fallback message once and end the call."
-        )
-        live_config["first_line"] = fallback_line
-        live_config["_terminate_after_first_line"] = True
-        live_config["max_turns"] = 1
-        logger.warning(
-            "tenant.config.unavailable",
-            extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked},
-        )
     logger.info(
         "config.runtime.selected",
         extra={
@@ -407,6 +390,31 @@ async def entrypoint(ctx: JobContext):
             "fallback_reason": resolved_config.fallback_reason,
         },
     )
+    if not tenant_id or resolved_config.source != "postgres.tenants":
+        logger.error(
+            "tenant.runtime.missing_abort_call",
+            extra={
+                "call_id": call_id,
+                "tenant_id": tenant_id,
+                "did": did_masked,
+                "config_source": resolved_config.source,
+                "fallback_reason": resolved_config.fallback_reason,
+            },
+        )
+        return
+    if not (live_config.get("agent_instructions") or "").strip() or not (live_config.get("first_line") or "").strip():
+        logger.error(
+            "tenant.runtime.incomplete_abort_call",
+            extra={
+                "call_id": call_id,
+                "tenant_id": tenant_id,
+                "did": did_masked,
+                "has_prompt": bool((live_config.get("agent_instructions") or "").strip()),
+                "has_greeting": bool((live_config.get("first_line") or "").strip()),
+            },
+        )
+        return
+    postgres_tenant_runtime = True
     delay_setting = live_config.get("stt_min_endpointing_delay", 0.2)
     llm_model     = live_config.get("llm_model", "gpt-4o-mini")
     llm_provider  = live_config.get("llm_provider", "openai")
@@ -465,8 +473,6 @@ async def entrypoint(ctx: JobContext):
 
     # ── Caller memory (#15) ───────────────────────────────────────────────
     async def get_caller_history(phone: str) -> str:
-        if tenant_unavailable:
-            return ""
         if phone == "unknown":
             return ""
         if tenant_id and is_postgres_enabled():

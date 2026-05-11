@@ -93,8 +93,8 @@ def seed_default_tenant_from_env() -> Optional[dict]:
     """Seed or update the demo tenant from EasyPanel environment variables."""
     phone_number = (os.environ.get("DEFAULT_PHONE_NUMBER") or "").strip()
     if not phone_number:
-        logger.info("tenants.seed.skipped", extra={"reason": "DEFAULT_PHONE_NUMBER_missing"})
-        return None
+        logger.error("tenants.seed.failed", extra={"reason": "DEFAULT_PHONE_NUMBER_missing"})
+        raise RuntimeError("DEFAULT_PHONE_NUMBER must be set so inbound DID tenant lookup can be seeded")
 
     name = (os.environ.get("DEFAULT_BUSINESS_NAME") or "Demo Business").strip()
     system_prompt = (
@@ -178,7 +178,23 @@ def get_tenant_by_did(phone_number: str) -> Optional[dict]:
                 (phone_number, normalized, storage_digits),
             )
             row = cur.fetchone()
-            return _tenant_row(row) if row else None
+            if not row:
+                logger.warning(
+                    "tenant.resolve.not_found",
+                    extra={"did_masked": _mask_phone(phone_number), "phone_digits": normalized[-10:]},
+                )
+                return None
+            tenant = _tenant_row(row)
+            logger.info(
+                "tenant.resolved_from_did",
+                extra={
+                    "tenant_id": str(tenant.get("id") or ""),
+                    "tenant_name": tenant.get("name"),
+                    "did_masked": _mask_phone(phone_number),
+                    "matched_phone_masked": _mask_phone(str(tenant.get("phone_number") or "")),
+                },
+            )
+            return tenant
 
 
 def get_tenant_by_id(tenant_id: UUID) -> Optional[dict]:
