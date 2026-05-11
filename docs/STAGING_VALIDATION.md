@@ -193,10 +193,12 @@ Preconditions:
 
 Expected behavior:
 
+- Worker startup logs `bootstrap.starting` before LiveKit starts accepting jobs.
 - Startup attempts pool initialization.
 - If DB is reachable, logs show `postgres.connected`.
 - The app creates or upgrades the `tenants` table automatically and logs `tenants.schema.ready`.
 - The app seeds the default tenant and logs `tenants.seed.ready`.
+- Worker bootstrap logs `bootstrap.completed`.
 - DID resolves to tenant.
 - Config source log shows `config_source=postgres.tenants`.
 - Post-call call log dual-write completes when tenant is resolved.

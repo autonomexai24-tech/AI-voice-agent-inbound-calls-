@@ -21,11 +21,13 @@ logger = get_logger("backend.db.tenants")
 TENANT_SELECT = """
     id,
     name,
+    slug,
     phone_number,
     system_prompt,
     welcome_message,
     languages,
     voice,
+    llm_model,
     is_active,
     created_at
 """
@@ -52,11 +54,13 @@ def ensure_tenants_schema() -> None:
                 CREATE TABLE IF NOT EXISTS tenants (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     name TEXT NOT NULL,
+                    slug TEXT NOT NULL DEFAULT '',
                     phone_number TEXT NOT NULL UNIQUE,
                     system_prompt TEXT NOT NULL DEFAULT '',
                     welcome_message TEXT NOT NULL DEFAULT '',
                     languages TEXT NOT NULL DEFAULT 'multilingual',
                     voice TEXT NOT NULL DEFAULT 'kavya',
+                    llm_model TEXT NOT NULL DEFAULT 'gpt-4o-mini',
                     is_active BOOLEAN NOT NULL DEFAULT TRUE,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
@@ -65,18 +69,28 @@ def ensure_tenants_schema() -> None:
             # Existing EasyPanel databases may have an older tenants table.
             # Add the MVP columns in-place and ignore legacy columns.
             for statement in (
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS slug TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS system_prompt TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS welcome_message TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS languages TEXT NOT NULL DEFAULT 'multilingual'",
                 "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS voice TEXT NOT NULL DEFAULT 'kavya'",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS llm_model TEXT NOT NULL DEFAULT 'gpt-4o-mini'",
                 "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE",
                 "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             ):
                 cur.execute(statement)
+            cur.execute("UPDATE tenants SET slug = regexp_replace(lower(trim(name)), '[^a-z0-9]+', '-', 'g') WHERE slug = ''")
             cur.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_phone_digits
                 ON tenants ((regexp_replace(phone_number, '[^0-9]', '', 'g')))
+                """
+            )
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_slug_lower
+                ON tenants ((lower(slug)))
+                WHERE is_active = TRUE
                 """
             )
             cur.execute(
@@ -107,8 +121,10 @@ def seed_default_tenant_from_env() -> Optional[dict]:
     ).strip()
     languages = (os.environ.get("DEFAULT_LANGUAGES") or "multilingual").strip()
     voice = (os.environ.get("DEFAULT_VOICE") or "kavya").strip()
+    llm_model = (os.environ.get("DEFAULT_LLM_MODEL") or "gpt-4o-mini").strip()
     normalized_phone = _normalize_phone_for_storage(phone_number)
     phone_digits = _phone_digits(normalized_phone)
+    slug = _slugify(name)
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -127,23 +143,35 @@ def seed_default_tenant_from_env() -> Optional[dict]:
                     """
                     UPDATE tenants
                     SET name = COALESCE(NULLIF(name, ''), %s),
+                        slug = COALESCE(NULLIF(slug, ''), %s),
                         phone_number = %s,
                         system_prompt = COALESCE(NULLIF(system_prompt, ''), %s),
                         welcome_message = COALESCE(NULLIF(welcome_message, ''), %s),
                         languages = COALESCE(NULLIF(languages, ''), %s),
                         voice = COALESCE(NULLIF(voice, ''), %s),
+                        llm_model = COALESCE(NULLIF(llm_model, ''), %s),
                         is_active = TRUE
                     WHERE id = %s
                     """,
-                    (name, normalized_phone, system_prompt, welcome_message, languages, voice, str(existing[0])),
+                    (
+                        name,
+                        slug,
+                        normalized_phone,
+                        system_prompt,
+                        welcome_message,
+                        languages,
+                        voice,
+                        llm_model,
+                        str(existing[0]),
+                    ),
                 )
             else:
                 cur.execute(
                     """
-                    INSERT INTO tenants (name, phone_number, system_prompt, welcome_message, languages, voice, is_active)
-                    VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                    INSERT INTO tenants (name, slug, phone_number, system_prompt, welcome_message, languages, voice, llm_model, is_active)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
                     """,
-                    (name, normalized_phone, system_prompt, welcome_message, languages, voice),
+                    (name, slug, normalized_phone, system_prompt, welcome_message, languages, voice, llm_model),
                 )
 
     tenant = get_tenant_by_did(normalized_phone)
@@ -214,14 +242,24 @@ def get_tenant_by_id(tenant_id: UUID) -> Optional[dict]:
 
 
 def get_tenant_by_slug(slug: str) -> Optional[dict]:
-    """Compatibility lookup for dashboard workspace slugs.
-
-    The simplified table does not store a slug. It derives one from `name`
-    so existing URLs and cookies can keep using workspace slugs.
-    """
+    """Lookup active tenants by workspace slug."""
     clean_slug = _slugify(slug)
     with get_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {TENANT_SELECT}
+                FROM tenants
+                WHERE is_active = TRUE
+                  AND lower(slug) = lower(%s)
+                LIMIT 1
+                """,
+                (clean_slug,),
+            )
+            row = cur.fetchone()
+            if row:
+                return _tenant_row(row)
+
             cur.execute(f"SELECT {TENANT_SELECT} FROM tenants WHERE is_active = TRUE")
             for row in cur.fetchall():
                 tenant = _tenant_row(row)
@@ -255,24 +293,28 @@ def create_tenant(
     welcome_message: str = "",
     languages: str = "multilingual",
     voice: str = "kavya",
+    llm_model: str = "gpt-4o-mini",
 ) -> UUID:
     normalized_phone = _normalize_phone_for_storage(phone_number)
+    clean_slug = _slugify(slug or name)
     _raise_if_did_exists(normalized_phone)
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO tenants (name, phone_number, system_prompt, welcome_message, languages, voice, is_active)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO tenants (name, slug, phone_number, system_prompt, welcome_message, languages, voice, llm_model, is_active)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (
                     name.strip(),
+                    clean_slug,
                     normalized_phone,
                     system_prompt or "",
                     welcome_message or f"Hello, thank you for calling {name.strip()}. How may I help you today?",
                     languages or "multilingual",
                     voice or "kavya",
+                    llm_model or "gpt-4o-mini",
                     is_active,
                 ),
             )
@@ -283,11 +325,13 @@ def create_tenant(
 def update_tenant(tenant_id: UUID, updates: dict[str, Any]) -> bool:
     allowed = {
         "name",
+        "slug",
         "phone_number",
         "system_prompt",
         "welcome_message",
         "languages",
         "voice",
+        "llm_model",
         "is_active",
     }
     aliases = {
@@ -306,6 +350,8 @@ def update_tenant(tenant_id: UUID, updates: dict[str, Any]) -> bool:
             continue
         if column == "phone_number" and value:
             clean[column] = _normalize_phone_for_storage(str(value))
+        elif column == "slug" and value:
+            clean[column] = _slugify(str(value))
         elif value is not None:
             clean[column] = value
     if not clean:
@@ -357,6 +403,7 @@ def provision_tenant(
         ),
         languages=str(config.get("languages") or config.get("tts_language") or config.get("lang_preset") or "multilingual"),
         voice=str(config.get("voice") or config.get("tts_voice") or "kavya"),
+        llm_model=str(config.get("llm_model") or os.environ.get("DEFAULT_LLM_MODEL") or "gpt-4o-mini"),
     )
     tenant = get_tenant_by_id(tenant_id)
     return {
@@ -370,15 +417,16 @@ def _tenant_row(row: tuple | None) -> dict:
     tenant = {
         "id": row[0],
         "name": row[1],
-        "phone_number": row[2],
-        "system_prompt": row[3] or "",
-        "welcome_message": row[4] or "",
-        "languages": row[5] or "multilingual",
-        "voice": row[6] or "kavya",
-        "is_active": bool(row[7]),
-        "created_at": row[8],
+        "slug": row[2] or _slugify(row[1]),
+        "phone_number": row[3],
+        "system_prompt": row[4] or "",
+        "welcome_message": row[5] or "",
+        "languages": row[6] or "multilingual",
+        "voice": row[7] or "kavya",
+        "llm_model": row[8] or "gpt-4o-mini",
+        "is_active": bool(row[9]),
+        "created_at": row[10],
     }
-    tenant["slug"] = _slugify(tenant["name"])
     tenant.update(_runtime_config(tenant))
     return tenant
 
@@ -396,7 +444,7 @@ def _runtime_config(tenant: Optional[dict]) -> dict:
         "tts_language": language_code,
         "stt_language": "unknown" if languages.lower() in {"multilingual", "auto", "unknown"} else language_code,
         "lang_preset": languages,
-        "llm_model": os.environ.get("DEFAULT_LLM_MODEL", "gpt-4o-mini"),
+        "llm_model": tenant.get("llm_model") or os.environ.get("DEFAULT_LLM_MODEL", "gpt-4o-mini"),
         "endpointing_delay": float(os.environ.get("DEFAULT_ENDPOINTING_DELAY", "0.5")),
         "business_hours_json": None,
         "transfer_number": os.environ.get("DEFAULT_TRANSFER_NUMBER"),

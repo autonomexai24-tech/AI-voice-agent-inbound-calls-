@@ -72,13 +72,13 @@ from backend.voice.language import LANGUAGE_PRESETS, get_language_instruction
 from backend.voice.prompts import get_ist_time_context
 from backend.voice.transfer import build_sip_transfer_uri
 from backend.core.config_resolver import resolve_runtime_config_async
-from backend.core.startup import run_startup_checks
 from backend.db.call_logs import insert_call_log
 from backend.db.connection import is_postgres_enabled
 from backend.integrations.storage import S3StorageProvider, build_recording_storage_key
 from backend.services.notification_service import send_booking_confirmation_sms
 from backend.services.recording_service import record_livekit_upload_metadata
 from backend.utils.formatting import mask_phone
+from app.bootstrap import bootstrap_system
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1615,8 +1615,12 @@ def _parse_booking_datetime(value: str) -> datetime:
 # WORKER ENTRY
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def start_worker() -> None:
+    await bootstrap_system("voice-agent")
+
+
 if __name__ == "__main__":
-    run_startup_checks("voice-agent")
+    asyncio.run(start_worker())
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
         agent_name=os.getenv("LIVEKIT_AGENT_NAME", "inbound-receptionist"),

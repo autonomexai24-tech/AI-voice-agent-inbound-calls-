@@ -117,7 +117,7 @@ def _result_from_tenant(tenant: Optional[dict], *, did: str) -> ResolvedRuntimeC
             "tts_language": tenant.get("tts_language") or "hi-IN",
             "stt_language": tenant.get("stt_language") or "unknown",
             "lang_preset": tenant.get("languages") or tenant.get("lang_preset") or "multilingual",
-            "llm_model": os.environ.get("DEFAULT_LLM_MODEL", "gpt-4o-mini"),
+            "llm_model": tenant.get("llm_model") or os.environ.get("DEFAULT_LLM_MODEL", "gpt-4o-mini"),
             "stt_min_endpointing_delay": float(os.environ.get("DEFAULT_ENDPOINTING_DELAY", "0.5")),
             "business_name": tenant.get("name"),
             "business_phone": tenant.get("phone_number"),

@@ -103,6 +103,7 @@ class AsyncRuntimeResolverTests(unittest.IsolatedAsyncioTestCase):
             "tts_language": "ta-IN",
             "stt_language": "ta-IN",
             "languages": "tamil",
+            "llm_model": "gpt-4.1-mini",
         }
 
         with patch.object(config_resolver, "is_postgres_enabled", return_value=True), patch.object(
@@ -118,7 +119,7 @@ class AsyncRuntimeResolverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved.config["agent_instructions"], "Tenant prompt")
         self.assertEqual(resolved.config["first_line"], "Tenant greeting")
         self.assertEqual(resolved.config["tts_language"], "ta-IN")
-        self.assertEqual(resolved.config["llm_model"], "gpt-4o-mini")
+        self.assertEqual(resolved.config["llm_model"], "gpt-4.1-mini")
 
     async def test_async_resolver_does_not_invent_missing_tenant_greeting(self):
         tenant = {
