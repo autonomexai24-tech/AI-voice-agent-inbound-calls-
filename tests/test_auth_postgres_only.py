@@ -4,7 +4,6 @@ import os
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from unittest.mock import patch
 from uuid import UUID
 
@@ -17,57 +16,14 @@ TENANT_A = "11111111-1111-1111-1111-111111111111"
 TENANT_B = "22222222-2222-2222-2222-222222222222"
 
 
-class AuthCursor:
-    def __init__(self, *, tenant=None, user=None, other_workspace=False) -> None:
-        self.tenant = tenant
-        self.user = user
-        self.other_workspace = other_workspace
-        self.query = ""
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def execute(self, query, params=()) -> None:
-        self.query = " ".join(str(query).lower().split())
-
-    def fetchone(self):
-        if "from tenants" in self.query and "where lower(slug)" in self.query:
-            return self.tenant
-        if "from users" in self.query and "tenant_id = %s" in self.query:
-            return self.user
-        if "join tenants" in self.query:
-            return ("other-workspace",) if self.other_workspace else None
-        return None
-
-    def fetchall(self):
-        return []
-
-
-class AuthConnection:
-    def __init__(self, cursor: AuthCursor) -> None:
-        self.cursor_obj = cursor
-
-    def cursor(self):
-        return self.cursor_obj
-
-
-def tenant_row(tenant_id=TENANT_A, slug="autonomex-ai", active=True):
-    return (tenant_id, "Autonomex AI", slug, "+917676808950", active)
-
-
-def user_row(tenant_id=TENANT_A):
-    return ("harsh@example.com", "stored-hash", tenant_id)
-
-
-def connection_factory(cursor: AuthCursor):
-    @contextmanager
-    def _fake_connection():
-        yield AuthConnection(cursor)
-
-    return _fake_connection
+def tenant_dict(tenant_id=TENANT_A, slug="autonomex-ai", active=True):
+    return {
+        "id": UUID(str(tenant_id)),
+        "name": "Autonomex AI",
+        "slug": slug,
+        "phone_number": "+917676808950",
+        "is_active": active,
+    }
 
 
 def session_token(*, tenant_id=TENANT_A, tenant_slug="autonomex-ai", exp=None):
@@ -114,10 +70,9 @@ class PostgresOnlyAuthTests(unittest.TestCase):
         self.assertIn("Workspace is required", response.json()["detail"])
 
     def test_unknown_workspace_is_distinct(self):
-        cursor = AuthCursor(tenant=None)
-        with patch("ui_server.is_postgres_enabled", return_value=True), patch(
-            "ui_server.get_connection", connection_factory(cursor)
-        ):
+        with patch.dict(os.environ, {"DASHBOARD_PASSWORD": "correct", "DASHBOARD_EMAIL": "harsh@example.com"}, clear=False), patch(
+            "ui_server.is_postgres_enabled", return_value=True
+        ), patch("backend.db.tenants.get_tenant_by_slug", return_value=None):
             response = self.client.post(
                 "/api/auth/login",
                 json={"email": "harsh@example.com", "password": "correct", "tenant_slug": "missing"},
@@ -126,24 +81,22 @@ class PostgresOnlyAuthTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertIn("Workspace not found", response.json()["detail"])
 
-    def test_wrong_workspace_is_distinct(self):
-        cursor = AuthCursor(tenant=tenant_row(), user=None, other_workspace=True)
-        with patch("ui_server.is_postgres_enabled", return_value=True), patch(
-            "ui_server.get_connection", connection_factory(cursor)
-        ):
+    def test_inactive_workspace_is_distinct(self):
+        with patch.dict(os.environ, {"DASHBOARD_PASSWORD": "correct", "DASHBOARD_EMAIL": "harsh@example.com"}, clear=False), patch(
+            "ui_server.is_postgres_enabled", return_value=True
+        ), patch("backend.db.tenants.get_tenant_by_slug", return_value=tenant_dict(active=False)):
             response = self.client.post(
                 "/api/auth/login",
                 json={"email": "harsh@example.com", "password": "correct", "tenant_slug": "autonomex-ai"},
             )
 
         self.assertEqual(response.status_code, 403)
-        self.assertIn("different workspace", response.json()["detail"])
+        self.assertIn("Workspace is inactive", response.json()["detail"])
 
     def test_invalid_password_is_distinct(self):
-        cursor = AuthCursor(tenant=tenant_row(), user=user_row())
-        with patch("ui_server.is_postgres_enabled", return_value=True), patch(
-            "ui_server.get_connection", connection_factory(cursor)
-        ), patch("ui_server._verify_password", return_value=False):
+        with patch.dict(os.environ, {"DASHBOARD_PASSWORD": "correct", "DASHBOARD_EMAIL": "harsh@example.com"}, clear=False), patch(
+            "ui_server.is_postgres_enabled", return_value=True
+        ), patch("backend.db.tenants.get_tenant_by_slug", return_value=tenant_dict()):
             response = self.client.post(
                 "/api/auth/login",
                 json={"email": "harsh@example.com", "password": "wrong", "tenant_slug": "autonomex-ai"},
@@ -153,10 +106,9 @@ class PostgresOnlyAuthTests(unittest.TestCase):
         self.assertEqual(response.json()["detail"], "Invalid password.")
 
     def test_successful_login_sets_session_cookie(self):
-        cursor = AuthCursor(tenant=tenant_row(), user=user_row())
-        with patch("ui_server.is_postgres_enabled", return_value=True), patch(
-            "ui_server.get_connection", connection_factory(cursor)
-        ), patch("ui_server._verify_password", return_value=True):
+        with patch.dict(os.environ, {"DASHBOARD_PASSWORD": "correct", "DASHBOARD_EMAIL": "harsh@example.com"}, clear=False), patch(
+            "ui_server.is_postgres_enabled", return_value=True
+        ), patch("backend.db.tenants.get_tenant_by_slug", return_value=tenant_dict()):
             response = self.client.post(
                 "/api/auth/login",
                 json={"email": "harsh@example.com", "password": "correct", "tenant_slug": "autonomex-ai"},
@@ -267,14 +219,12 @@ class PostgresOnlyAuthTests(unittest.TestCase):
         self.assertEqual(captured_tenants, [UUID(TENANT_A), UUID(TENANT_B)])
 
     def test_concurrent_logins_do_not_share_session_state(self):
-        cursor = AuthCursor(tenant=tenant_row(), user=user_row())
-
         def login_once():
             return ui_server._authenticate("harsh@example.com", "correct", "autonomex-ai")
 
-        with patch("ui_server.is_postgres_enabled", return_value=True), patch(
-            "ui_server.get_connection", connection_factory(cursor)
-        ), patch("ui_server._verify_password", return_value=True):
+        with patch.dict(os.environ, {"DASHBOARD_PASSWORD": "correct", "DASHBOARD_EMAIL": "harsh@example.com"}, clear=False), patch(
+            "ui_server.is_postgres_enabled", return_value=True
+        ), patch("backend.db.tenants.get_tenant_by_slug", return_value=tenant_dict()):
             with ThreadPoolExecutor(max_workers=4) as executor:
                 results = list(executor.map(lambda _: login_once(), range(4)))
 

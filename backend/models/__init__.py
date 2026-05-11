@@ -1,8 +1,8 @@
-"""Typed domain entities (Phase 2 scaffolding).
+"""Typed domain entities.
 
-Plain dataclasses mirroring the PostgreSQL schema in ARCHITECTURE.md §4.
-No Pydantic, no ORM — pure standard-library dataclasses keep Phase 2
-dependency-free and avoid coupling the voice path to a validation lib.
+Plain dataclasses mirroring the PostgreSQL tables used by the app. No
+Pydantic, no ORM — pure standard-library dataclasses avoid coupling the
+voice path to a validation library.
 
 These types are reference shapes for future typed API layers. The
 backend.db.* functions currently return dict[str, Any] for pragmatic
@@ -15,14 +15,10 @@ from backend.models.entities import (
     CallRecording,
     NotificationEvent,
     Tenant,
-    TenantConfig,
-    User,
 )
 
 __all__ = [
     "Tenant",
-    "User",
-    "TenantConfig",
     "CallLog",
     "Booking",
     "NotificationEvent",

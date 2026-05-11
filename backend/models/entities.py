@@ -1,14 +1,15 @@
 """Dataclass mirrors of the PostgreSQL schema.
 
-Each class corresponds 1:1 to a table in `migrations/001_initial.sql`.
-Field names and types match the SQL columns. No business logic.
+The inbound voice MVP stores tenant runtime configuration directly on the
+`tenants` table so a new call can load prompt, greeting, language, and
+voice with one indexed DID lookup.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 from uuid import UUID
 
 
@@ -16,37 +17,13 @@ from uuid import UUID
 class Tenant:
     id: UUID
     name: str
-    slug: str
     phone_number: str
+    system_prompt: str
+    welcome_message: str
+    languages: str
+    voice: str
     is_active: bool
     created_at: datetime
-
-
-@dataclass(frozen=True)
-class User:
-    id: UUID
-    tenant_id: UUID
-    email: str
-    password_hash: str
-    created_at: datetime
-
-
-@dataclass(frozen=True)
-class TenantConfig:
-    id: UUID
-    tenant_id: UUID
-    agent_instructions: Optional[str]
-    first_line: Optional[str]
-    tts_voice: str
-    tts_language: str
-    lang_preset: str
-    llm_model: str
-    endpointing_delay: float
-    business_hours_json: Optional[Any]
-    transfer_number: Optional[str]
-    cal_api_key: Optional[str]
-    cal_event_type_id: Optional[str]
-    updated_at: datetime
 
 
 @dataclass(frozen=True)

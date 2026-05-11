@@ -97,6 +97,10 @@ def run_startup_checks(
     if initialize_postgres and is_postgres_enabled():
         try:
             init_pool()
+            from backend.db.tenants import ensure_tenants_schema, seed_default_tenant_from_env
+
+            ensure_tenants_schema()
+            seed_default_tenant_from_env()
             _record_startup_status(
                 status="ok",
                 service=service_name,
@@ -104,7 +108,7 @@ def run_startup_checks(
                 postgres_initialized=True,
                 last_error=None,
             )
-            log.info("startup.postgres_initialized", extra={"service": service_name})
+            log.info("startup.postgres_initialized", extra={"service": service_name, "schema": "tenants"})
         except Exception as exc:  # noqa: BLE001
             _record_startup_status(
                 status="degraded",

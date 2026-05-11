@@ -5,7 +5,7 @@ As of Phase 3A, `agent.py` imports from this module; there is no longer
 a duplicate definition in root-level code.
 
 Contract:
-- Keys: preset names used in tenant_config.lang_preset.
+- Keys: preset names accepted in tenants.languages.
 - Each value dict has: label, tts_language, tts_voice, instruction.
 - "multilingual" is the default when an unknown preset is requested.
 """

@@ -1,16 +1,8 @@
-"""Tenant resolution + config loading (Phase 2 scaffolding).
+"""Tenant resolution for the single-table inbound voice MVP.
 
-Thin wrapper over `backend.db.tenants`. The voice agent will call
-`resolve_from_did()` at call start to:
-  1. Map the dialed Vobiz DID to a tenant id.
-  2. Load the tenant_config row (prompt, voice, language, hours, etc.).
-
-Phase 2 rule: thin. This service does not cache, does not reach out to
-external providers, and does not retry — the PG pool already handles
-connection concerns, and the tenant lookup is a single indexed query.
-
-Not yet wired to agent.py. Phase 3 will replace the current
-`get_live_config()` + `config.json` cascade with this.
+Thin wrapper over `backend.db.tenants`. The call path maps the dialed
+VoBiz DID directly to one `tenants` row and reads prompt, greeting,
+language, and voice from that row.
 """
 
 from __future__ import annotations
@@ -34,8 +26,7 @@ class TenantService:
     def resolve_from_did(self, phone_number: str) -> dict:
         """Return `{tenant, config}` for an inbound call's DID.
 
-        Raises TenantNotConfiguredError if no tenant matches the DID, per
-        the error handling policy documented in WORKFLOW.md §10.
+        Raises TenantNotConfiguredError if no active tenant matches the DID.
         """
         tenant = tenant_repo.get_tenant_by_did(phone_number)
         if tenant is None:
@@ -45,17 +36,7 @@ class TenantService:
             )
             raise TenantNotConfiguredError(phone_number)
 
-        config = tenant_repo.get_tenant_config(tenant["id"])
-        if config is None:
-            # The DID is known but has no config row. This is a
-            # provisioning bug; surface it clearly rather than falling
-            # back to defaults that might leak another tenant's prompt.
-            logger.error(
-                "tenant.config.missing",
-                extra={"tenant_id": str(tenant["id"])},
-            )
-            raise TenantNotConfiguredError(phone_number)
-
+        config = tenant_repo.get_runtime_config(tenant["id"]) or {}
         return {"tenant": tenant, "config": config}
 
     def get_by_id(self, tenant_id: UUID) -> Optional[dict]:
@@ -89,7 +70,7 @@ class TenantService:
         return tenant_repo.update_tenant(tenant_id, updates)
 
     def update_config(self, tenant_id: UUID, updates: dict) -> None:
-        tenant_repo.update_tenant_config(tenant_id, updates)
+        tenant_repo.update_runtime_config(tenant_id, updates)
 
 
 def _mask_phone(phone: str) -> str:

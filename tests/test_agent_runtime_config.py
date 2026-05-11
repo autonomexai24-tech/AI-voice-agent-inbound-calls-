@@ -91,27 +91,22 @@ class AgentRuntimeConfigTests(unittest.TestCase):
 
 
 class AsyncRuntimeResolverTests(unittest.IsolatedAsyncioTestCase):
-    async def test_async_resolver_loads_tenant_config_from_postgres_helpers(self):
+    async def test_async_resolver_loads_runtime_config_from_tenants_table(self):
         tenant = {
             "id": TENANT_ID,
             "name": "Autonomex AI",
             "slug": "autonomex-ai",
             "phone_number": "+917676808950",
-        }
-        tenant_config = {
-            "agent_instructions": "Tenant prompt",
-            "first_line": "Tenant greeting",
-            "tts_voice": "kavya",
+            "system_prompt": "Tenant prompt",
+            "welcome_message": "Tenant greeting",
+            "voice": "kavya",
             "tts_language": "ta-IN",
-            "lang_preset": "tamil",
-            "llm_model": "gpt-4o-mini",
-            "endpointing_delay": 0.4,
+            "stt_language": "ta-IN",
+            "languages": "tamil",
         }
 
         with patch.object(config_resolver, "is_postgres_enabled", return_value=True), patch.object(
             config_resolver, "get_tenant_by_did", new=AsyncMock(return_value=tenant)
-        ), patch.object(
-            config_resolver, "load_tenant_config", new=AsyncMock(return_value=tenant_config)
         ):
             resolved = await config_resolver.resolve_runtime_config_async(
                 caller_phone="+919111111111",
@@ -119,7 +114,7 @@ class AsyncRuntimeResolverTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(resolved.tenant_id, TENANT_ID)
-        self.assertEqual(resolved.source, "postgres")
+        self.assertEqual(resolved.source, "postgres.tenants")
         self.assertEqual(resolved.config["agent_instructions"], "Tenant prompt")
         self.assertEqual(resolved.config["first_line"], "Tenant greeting")
         self.assertEqual(resolved.config["tts_language"], "ta-IN")

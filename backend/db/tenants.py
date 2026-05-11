@@ -1,62 +1,196 @@
-"""Tenant lookup and configuration access (raw SQL).
+"""Single-table tenant storage for the inbound voice MVP.
 
-Per ARCHITECTURE.md §4:
-- tenants table: id, name, slug, phone_number (Vobiz DID), created_at
-- tenant_config table: per-tenant AI personality configuration
-
-Per RULES.md: every query touching tenant-scoped data filters by tenant_id.
-Here, tenant_id is the resolved identity; queries lookup BY it or BY DID.
+The live voice worker resolves a tenant by the dialed DID and reads the
+runtime prompt directly from `tenants.system_prompt`. There is no
+extra configuration table on the call path.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Optional
 from uuid import UUID
 
-from psycopg2.extras import Json
-
 from backend.db.connection import get_connection
-from backend.utils.passwords import hash_password
 from backend.utils.logging import get_logger
 
 logger = get_logger("backend.db.tenants")
 
 
-_TENANT_COLUMNS = "id, name, slug, phone_number, is_active, created_at"
-_CONFIG_COLUMNS = (
-    "agent_instructions",
-    "first_line",
-    "tts_voice",
-    "tts_language",
-    "lang_preset",
-    "llm_model",
-    "endpointing_delay",
-    "business_hours_json",
-    "transfer_number",
-    "cal_api_key",
-    "cal_event_type_id",
-)
+TENANT_SELECT = """
+    id,
+    name,
+    phone_number,
+    system_prompt,
+    welcome_message,
+    languages,
+    voice,
+    is_active,
+    created_at
+"""
+
+SUPPORTED_LANGUAGE_CODES = {"en-IN", "hi-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN"}
+LANGUAGE_PRESET_TO_CODE = {
+    "english": "en-IN",
+    "hindi": "hi-IN",
+    "hinglish": "hi-IN",
+    "tamil": "ta-IN",
+    "telugu": "te-IN",
+    "kannada": "kn-IN",
+    "malayalam": "ml-IN",
+}
 
 
-def get_tenant_by_did(phone_number: str) -> Optional[dict]:
-    """Look up a tenant by the dialed DID (Vobiz phone number).
+def ensure_tenants_schema() -> None:
+    """Create or upgrade the single tenants table required by the MVP."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute('CREATE EXTENSION IF NOT EXISTS "pgcrypto"')
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tenants (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    name TEXT NOT NULL,
+                    phone_number TEXT NOT NULL UNIQUE,
+                    system_prompt TEXT NOT NULL DEFAULT '',
+                    welcome_message TEXT NOT NULL DEFAULT '',
+                    languages TEXT NOT NULL DEFAULT 'multilingual',
+                    voice TEXT NOT NULL DEFAULT 'kavya',
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            # Existing EasyPanel databases may have an older tenants table.
+            # Add the MVP columns in-place and ignore legacy columns.
+            for statement in (
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS system_prompt TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS welcome_message TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS languages TEXT NOT NULL DEFAULT 'multilingual'",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS voice TEXT NOT NULL DEFAULT 'kavya'",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            ):
+                cur.execute(statement)
+            cur.execute(
+                """
+                DO $$
+                BEGIN
+                    IF to_regclass('public.tenant_config') IS NOT NULL THEN
+                        UPDATE tenants AS t
+                        SET system_prompt = COALESCE(NULLIF(t.system_prompt, ''), tc.agent_instructions, ''),
+                            welcome_message = COALESCE(NULLIF(t.welcome_message, ''), tc.first_line, ''),
+                            voice = CASE
+                                WHEN t.voice IS NULL OR t.voice IN ('', 'kavya')
+                                    THEN COALESCE(NULLIF(tc.tts_voice, ''), 'kavya')
+                                ELSE t.voice
+                            END,
+                            languages = CASE
+                                WHEN t.languages IS NULL OR t.languages IN ('', 'multilingual')
+                                    THEN COALESCE(NULLIF(tc.lang_preset, ''), NULLIF(tc.tts_language, ''), 'multilingual')
+                                ELSE t.languages
+                            END
+                        FROM tenant_config AS tc
+                        WHERE tc.tenant_id = t.id;
+                    END IF;
+                END $$;
+                """
+            )
+            cur.execute("ALTER TABLE tenants DROP COLUMN IF EXISTS slug")
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_phone_digits
+                ON tenants ((regexp_replace(phone_number, '[^0-9]', '', 'g')))
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_tenants_active_phone_digits
+                ON tenants ((regexp_replace(phone_number, '[^0-9]', '', 'g')))
+                WHERE is_active = TRUE
+                """
+            )
+    logger.info("tenants.schema.ready")
 
-    Returns None if no tenant is configured for this DID.
-    """
-    normalized = _phone_digits(phone_number)
-    if not normalized:
+
+def seed_default_tenant_from_env() -> Optional[dict]:
+    """Seed or update the demo tenant from EasyPanel environment variables."""
+    phone_number = (os.environ.get("DEFAULT_PHONE_NUMBER") or "").strip()
+    if not phone_number:
+        logger.info("tenants.seed.skipped", extra={"reason": "DEFAULT_PHONE_NUMBER_missing"})
         return None
-    try:
-        storage_digits = _phone_digits(_normalize_phone_for_storage(phone_number))
-    except ValueError:
-        storage_digits = normalized
+
+    name = (os.environ.get("DEFAULT_BUSINESS_NAME") or "Demo Business").strip()
+    system_prompt = (
+        os.environ.get("DEFAULT_SYSTEM_PROMPT")
+        or "You are a helpful AI receptionist. Answer inbound calls politely and collect caller details when needed."
+    ).strip()
+    welcome_message = (
+        os.environ.get("DEFAULT_WELCOME_MESSAGE")
+        or f"Hello, thank you for calling {name}. How may I help you today?"
+    ).strip()
+    languages = (os.environ.get("DEFAULT_LANGUAGES") or "multilingual").strip()
+    voice = (os.environ.get("DEFAULT_VOICE") or "kavya").strip()
+    normalized_phone = _normalize_phone_for_storage(phone_number)
+    phone_digits = _phone_digits(normalized_phone)
 
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, name, slug, phone_number, is_active, created_at
+                SELECT id
+                FROM tenants
+                WHERE regexp_replace(phone_number, '[^0-9]', '', 'g') = %s
+                LIMIT 1
+                """,
+                (phone_digits,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE tenants
+                    SET name = COALESCE(NULLIF(name, ''), %s),
+                        phone_number = %s,
+                        system_prompt = COALESCE(NULLIF(system_prompt, ''), %s),
+                        welcome_message = COALESCE(NULLIF(welcome_message, ''), %s),
+                        languages = COALESCE(NULLIF(languages, ''), %s),
+                        voice = COALESCE(NULLIF(voice, ''), %s),
+                        is_active = TRUE
+                    WHERE id = %s
+                    """,
+                    (name, normalized_phone, system_prompt, welcome_message, languages, voice, str(existing[0])),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO tenants (name, phone_number, system_prompt, welcome_message, languages, voice, is_active)
+                    VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                    """,
+                    (name, normalized_phone, system_prompt, welcome_message, languages, voice),
+                )
+
+    tenant = get_tenant_by_did(normalized_phone)
+    logger.info(
+        "tenants.seed.ready",
+        extra={"tenant_id": str((tenant or {}).get("id") or ""), "phone_number_masked": _mask_phone(normalized_phone)},
+    )
+    return tenant
+
+
+def get_tenant_by_did(phone_number: str) -> Optional[dict]:
+    """Look up an active tenant by dialed DID using normalized digits."""
+    normalized = _phone_digits(phone_number)
+    if not normalized:
+        return None
+    storage_digits = _phone_digits(_normalize_phone_for_storage(phone_number)) or normalized
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {TENANT_SELECT}
                 FROM tenants
                 WHERE is_active = TRUE
                   AND (
@@ -69,36 +203,48 @@ def get_tenant_by_did(phone_number: str) -> Optional[dict]:
                 (phone_number, normalized, storage_digits),
             )
             row = cur.fetchone()
-            if row is None:
-                return None
-            return _tenant_row(row)
+            return _tenant_row(row) if row else None
 
 
 def get_tenant_by_id(tenant_id: UUID) -> Optional[dict]:
-    """Look up a tenant by primary key."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, name, slug, phone_number, is_active, created_at
-                FROM tenants
-                WHERE id = %s
-                """,
-                (str(tenant_id),),
-            )
-            row = cur.fetchone()
-            if row is None:
-                return None
-            return _tenant_row(row)
-
-
-def list_tenants(limit: int = 100) -> list[dict]:
-    """Return tenants for operator provisioning screens/tools."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT {_TENANT_COLUMNS}
+                SELECT {TENANT_SELECT}
+                FROM tenants
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (str(tenant_id),),
+            )
+            row = cur.fetchone()
+            return _tenant_row(row) if row else None
+
+
+def get_tenant_by_slug(slug: str) -> Optional[dict]:
+    """Compatibility lookup for dashboard workspace slugs.
+
+    The simplified table does not store a slug. It derives one from `name`
+    so existing URLs and cookies can keep using workspace slugs.
+    """
+    clean_slug = _slugify(slug)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {TENANT_SELECT} FROM tenants WHERE is_active = TRUE")
+            for row in cur.fetchall():
+                tenant = _tenant_row(row)
+                if tenant["slug"] == clean_slug:
+                    return tenant
+    return None
+
+
+def list_tenants(limit: int = 100) -> list[dict]:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {TENANT_SELECT}
                 FROM tenants
                 ORDER BY created_at DESC
                 LIMIT %s
@@ -111,107 +257,89 @@ def list_tenants(limit: int = 100) -> list[dict]:
 def create_tenant(
     *,
     name: str,
-    slug: str,
+    slug: str | None = None,
     phone_number: str,
     is_active: bool = True,
+    system_prompt: str = "",
+    welcome_message: str = "",
+    languages: str = "multilingual",
+    voice: str = "kavya",
 ) -> UUID:
-    """Create a tenant row and return its id."""
     normalized_phone = _normalize_phone_for_storage(phone_number)
-    clean_slug = _slugify(slug)
+    _raise_if_did_exists(normalized_phone)
     with get_connection() as conn:
         with conn.cursor() as cur:
-            _raise_if_did_exists(cur, normalized_phone)
-            _raise_if_slug_exists(cur, clean_slug)
             cur.execute(
                 """
-                INSERT INTO tenants (name, slug, phone_number, is_active)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO tenants (name, phone_number, system_prompt, welcome_message, languages, voice, is_active)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                (name.strip(), clean_slug, normalized_phone, is_active),
+                (
+                    name.strip(),
+                    normalized_phone,
+                    system_prompt or "",
+                    welcome_message or f"Hello, thank you for calling {name.strip()}. How may I help you today?",
+                    languages or "multilingual",
+                    voice or "kavya",
+                    is_active,
+                ),
             )
             (tenant_id,) = cur.fetchone()
             return tenant_id
 
 
 def update_tenant(tenant_id: UUID, updates: dict[str, Any]) -> bool:
-    """Apply whitelisted tenant updates. Returns True when a row changed."""
-    allowed = {"name", "slug", "phone_number", "is_active"}
+    allowed = {
+        "name",
+        "phone_number",
+        "system_prompt",
+        "welcome_message",
+        "languages",
+        "voice",
+        "is_active",
+    }
+    aliases = {
+        "agent_instructions": "system_prompt",
+        "first_line": "welcome_message",
+        "tts_voice": "voice",
+        "tts_language": "languages",
+        "lang_preset": "languages",
+        "business_name": "name",
+        "business_phone": "phone_number",
+    }
     clean: dict[str, Any] = {}
     for key, value in updates.items():
-        if key not in allowed:
+        column = aliases.get(key, key)
+        if column not in allowed:
             continue
-        if key == "slug" and value:
-            clean[key] = _slugify(str(value))
-        elif key == "phone_number" and value:
-            clean[key] = _normalize_phone_for_storage(str(value))
-        else:
-            clean[key] = value
+        if column == "phone_number" and value:
+            clean[column] = _normalize_phone_for_storage(str(value))
+        elif value is not None:
+            clean[column] = value
     if not clean:
         return False
+
+    if "phone_number" in clean:
+        _raise_if_did_exists(clean["phone_number"], exclude_tenant_id=tenant_id)
 
     set_clause = ", ".join(f"{column} = %s" for column in clean)
     params = list(clean.values()) + [str(tenant_id)]
     with get_connection() as conn:
         with conn.cursor() as cur:
-            if "phone_number" in clean:
-                _raise_if_did_exists(cur, clean["phone_number"], exclude_tenant_id=tenant_id)
-            if "slug" in clean:
-                _raise_if_slug_exists(cur, clean["slug"], exclude_tenant_id=tenant_id)
-            cur.execute(
-                f"""
-                UPDATE tenants
-                SET {set_clause}
-                WHERE id = %s
-                """,
-                params,
-            )
+            cur.execute(f"UPDATE tenants SET {set_clause} WHERE id = %s", params)
             return cur.rowcount > 0
 
 
-def create_user(
-    *,
-    tenant_id: UUID,
-    email: str,
-    password: str,
-) -> UUID:
-    """Create a dashboard user for a tenant."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO users (tenant_id, email, password_hash)
-                VALUES (%s, lower(%s), %s)
-                RETURNING id
-                """,
-                (str(tenant_id), email.strip(), hash_password(password)),
-            )
-            (user_id,) = cur.fetchone()
-            return user_id
+def get_runtime_config(tenant_id: UUID) -> Optional[dict]:
+    """Return the agent runtime settings derived from one tenants row."""
+    tenant = get_tenant_by_id(tenant_id)
+    return _runtime_config(tenant) if tenant else None
 
 
-def ensure_tenant_config(tenant_id: UUID, config: Optional[dict[str, Any]] = None) -> UUID:
-    """Create or update the one tenant_config row for a tenant."""
-    clean = _clean_config(config or {})
-    columns = list(_CONFIG_COLUMNS)
-    values = [_config_value(clean, column) for column in columns]
-    placeholders = ", ".join(["%s"] * (len(columns) + 1))
-    update_clause = ", ".join(f"{column} = EXCLUDED.{column}" for column in columns)
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                INSERT INTO tenant_config (tenant_id, {", ".join(columns)})
-                VALUES ({placeholders})
-                ON CONFLICT (tenant_id) DO UPDATE
-                SET {update_clause}, updated_at = NOW()
-                RETURNING id
-                """,
-                [str(tenant_id), *values],
-            )
-            (config_id,) = cur.fetchone()
-            return config_id
+def update_runtime_config(tenant_id: UUID, updates: dict) -> None:
+    """Update prompt, greeting, language, and voice fields on tenants."""
+    update_tenant(tenant_id, updates)
 
 
 def provision_tenant(
@@ -224,174 +352,106 @@ def provision_tenant(
     config: Optional[dict[str, Any]] = None,
     is_active: bool = True,
 ) -> dict:
-    """Provision tenant, first user, and tenant_config in one transaction."""
-    clean_name = name.strip()
-    requested_slug = _slugify(slug) if slug else None
-    clean_slug = requested_slug or _slugify(clean_name)
-    clean_phone = _normalize_phone_for_storage(phone_number)
-    clean_config = _clean_config(config or {})
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            _raise_if_did_exists(cur, clean_phone)
-            if requested_slug:
-                _raise_if_slug_exists(cur, requested_slug)
-            else:
-                clean_slug = _available_slug(cur, clean_slug)
-            base_slug = clean_slug
-            tenant = None
-            for _attempt in range(25):
-                cur.execute(
-                    """
-                    INSERT INTO tenants (name, slug, phone_number, is_active)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (slug) DO NOTHING
-                    RETURNING id, name, slug, phone_number, is_active, created_at
-                    """,
-                    (clean_name, clean_slug, clean_phone, is_active),
-                )
-                inserted = cur.fetchone()
-                if inserted is not None:
-                    tenant = _tenant_row(inserted)
-                    break
-                clean_slug = _available_slug(cur, base_slug)
-            if tenant is None:
-                raise ValueError("tenant_slug_unavailable")
-
-            cur.execute(
-                """
-                INSERT INTO users (tenant_id, email, password_hash)
-                VALUES (%s, lower(%s), %s)
-                RETURNING id, email, created_at
-                """,
-                (str(tenant["id"]), user_email.strip(), hash_password(user_password)),
-            )
-            user_row = cur.fetchone()
-
-            columns = list(_CONFIG_COLUMNS)
-            values = [_config_value(clean_config, column) for column in columns]
-            placeholders = ", ".join(["%s"] * (len(columns) + 1))
-            cur.execute(
-                f"""
-                INSERT INTO tenant_config (tenant_id, {", ".join(columns)})
-                VALUES ({placeholders})
-                RETURNING id
-                """,
-                [str(tenant["id"]), *values],
-            )
-            (config_id,) = cur.fetchone()
-
-            return {
-                "tenant": tenant,
-                "user": {
-                    "id": user_row[0],
-                    "email": user_row[1],
-                    "created_at": user_row[2],
-                },
-                "config_id": config_id,
-            }
-
-
-def get_tenant_config(tenant_id: UUID) -> Optional[dict]:
-    """Load the per-tenant AI configuration row.
-
-    Returns None if the tenant has no config row yet. Callers should treat
-    that as a misconfiguration (every active tenant should have a config).
-    """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    id,
-                    tenant_id,
-                    agent_instructions,
-                    first_line,
-                    tts_voice,
-                    tts_language,
-                    lang_preset,
-                    llm_model,
-                    endpointing_delay,
-                    business_hours_json,
-                    transfer_number,
-                    cal_api_key,
-                    cal_event_type_id,
-                    updated_at
-                FROM tenant_config
-                WHERE tenant_id = %s
-                """,
-                (str(tenant_id),),
-            )
-            row = cur.fetchone()
-            if row is None:
-                return None
-            return {
-                "id": row[0],
-                "tenant_id": row[1],
-                "agent_instructions": row[2],
-                "first_line": row[3],
-                "tts_voice": row[4],
-                "tts_language": row[5],
-                "lang_preset": row[6],
-                "llm_model": row[7],
-                "endpointing_delay": float(row[8]) if row[8] is not None else None,
-                "business_hours_json": row[9],
-                "transfer_number": row[10],
-                "cal_api_key": row[11],
-                "cal_event_type_id": row[12],
-                "updated_at": row[13],
-            }
-
-
-def update_tenant_config(tenant_id: UUID, updates: dict) -> None:
-    """Apply a partial update to a tenant's config row.
-
-    Only whitelisted columns are updatable. Unknown keys are ignored.
-    Updates `updated_at` to NOW() implicitly via the SET clause.
-    """
-    allowed = {
-        "agent_instructions",
-        "first_line",
-        "tts_voice",
-        "tts_language",
-        "lang_preset",
-        "llm_model",
-        "endpointing_delay",
-        "business_hours_json",
-        "transfer_number",
-        "cal_api_key",
-        "cal_event_type_id",
+    config = config or {}
+    tenant_id = create_tenant(
+        name=name,
+        slug=slug,
+        phone_number=phone_number,
+        is_active=is_active,
+        system_prompt=str(config.get("system_prompt") or config.get("agent_instructions") or ""),
+        welcome_message=str(
+            config.get("welcome_message")
+            or config.get("first_line")
+            or f"Hello, thank you for calling {name}. How may I help you today?"
+        ),
+        languages=str(config.get("languages") or config.get("tts_language") or config.get("lang_preset") or "multilingual"),
+        voice=str(config.get("voice") or config.get("tts_voice") or "kavya"),
+    )
+    tenant = get_tenant_by_id(tenant_id)
+    return {
+        "tenant": tenant,
+        "user": {"id": tenant_id, "email": user_email.strip().lower(), "created_at": (tenant or {}).get("created_at")},
+        "config_id": tenant_id,
     }
-    clean = {k: v for k, v in updates.items() if k in allowed}
-    if not clean:
-        return
-    if "business_hours_json" in clean and clean["business_hours_json"] is not None:
-        clean["business_hours_json"] = Json(clean["business_hours_json"])
 
-    set_clause = ", ".join(f"{col} = %s" for col in clean)
-    params = list(clean.values()) + [str(tenant_id)]
 
+def _tenant_row(row: tuple | None) -> dict:
+    tenant = {
+        "id": row[0],
+        "name": row[1],
+        "phone_number": row[2],
+        "system_prompt": row[3] or "",
+        "welcome_message": row[4] or "",
+        "languages": row[5] or "multilingual",
+        "voice": row[6] or "kavya",
+        "is_active": bool(row[7]),
+        "created_at": row[8],
+    }
+    tenant["slug"] = _slugify(tenant["name"])
+    tenant.update(_runtime_config(tenant))
+    return tenant
+
+
+def _runtime_config(tenant: Optional[dict]) -> dict:
+    if not tenant:
+        return {}
+    languages = str(tenant.get("languages") or "multilingual").strip() or "multilingual"
+    language_code = _language_code(languages)
+    return {
+        "tenant_id": tenant.get("id"),
+        "agent_instructions": tenant.get("system_prompt") or "",
+        "first_line": tenant.get("welcome_message") or "",
+        "tts_voice": tenant.get("voice") or "kavya",
+        "tts_language": language_code,
+        "stt_language": "unknown" if languages.lower() in {"multilingual", "auto", "unknown"} else language_code,
+        "lang_preset": languages,
+        "llm_model": os.environ.get("DEFAULT_LLM_MODEL", "gpt-4o-mini"),
+        "endpointing_delay": float(os.environ.get("DEFAULT_ENDPOINTING_DELAY", "0.5")),
+        "business_hours_json": None,
+        "transfer_number": os.environ.get("DEFAULT_TRANSFER_NUMBER"),
+        "cal_api_key": os.environ.get("CAL_API_KEY"),
+        "cal_event_type_id": os.environ.get("CALCOM_EVENT_TYPE_ID") or os.environ.get("CAL_EVENT_TYPE_ID"),
+        "system_prompt": tenant.get("system_prompt") or "",
+        "welcome_message": tenant.get("welcome_message") or "",
+        "languages": languages,
+        "voice": tenant.get("voice") or "kavya",
+    }
+
+
+def _language_code(value: str) -> str:
+    raw = str(value or "").strip()
+    if raw in SUPPORTED_LANGUAGE_CODES:
+        return raw
+    lowered = raw.lower()
+    if lowered in LANGUAGE_PRESET_TO_CODE:
+        return LANGUAGE_PRESET_TO_CODE[lowered]
+    for part in re.split(r"[, ]+", raw):
+        if part in SUPPORTED_LANGUAGE_CODES:
+            return part
+    return "hi-IN"
+
+
+def _raise_if_did_exists(phone_number: str, exclude_tenant_id: Optional[UUID] = None) -> None:
+    digits = _phone_digits(phone_number)
+    params: list[Any] = [digits]
+    exclusion = ""
+    if exclude_tenant_id:
+        exclusion = "AND id <> %s"
+        params.append(str(exclude_tenant_id))
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                UPDATE tenant_config
-                SET {set_clause}, updated_at = NOW()
-                WHERE tenant_id = %s
+                SELECT id
+                FROM tenants
+                WHERE regexp_replace(phone_number, '[^0-9]', '', 'g') = %s
+                  {exclusion}
+                LIMIT 1
                 """,
                 params,
             )
-
-
-def _tenant_row(row: tuple) -> dict:
-    return {
-        "id": row[0],
-        "name": row[1],
-        "slug": row[2],
-        "phone_number": row[3],
-        "is_active": bool(row[4]),
-        "created_at": row[5],
-    }
+            if cur.fetchone():
+                raise ValueError("tenant_did_already_exists")
 
 
 def _phone_digits(value: str) -> str:
@@ -414,90 +474,12 @@ def _normalize_phone_for_storage(value: str) -> str:
 
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
-    if not slug:
-        raise ValueError("tenant_slug_required")
-    return slug
+    return slug or "tenant"
 
 
-def _clean_config(config: dict[str, Any]) -> dict[str, Any]:
-    clean = {k: v for k, v in config.items() if k in _CONFIG_COLUMNS}
-    if "business_hours_json" in clean and clean["business_hours_json"] is not None:
-        clean["business_hours_json"] = Json(clean["business_hours_json"])
-    return clean
-
-
-def _config_value(config: dict[str, Any], column: str) -> Any:
-    defaults = {
-        "agent_instructions": "",
-        "first_line": "",
-        "tts_voice": "kavya",
-        "tts_language": "hi-IN",
-        "lang_preset": "multilingual",
-        "llm_model": "gpt-4o-mini",
-        "endpointing_delay": 0.5,
-        "business_hours_json": None,
-        "transfer_number": None,
-        "cal_api_key": None,
-        "cal_event_type_id": None,
-    }
-    return config.get(column, defaults[column])
-
-
-def _raise_if_did_exists(cur, phone_number: str, exclude_tenant_id: Optional[UUID] = None) -> None:
-    digits = _phone_digits(phone_number)
-    params: list[Any] = [digits]
-    exclusion = ""
-    if exclude_tenant_id:
-        exclusion = "AND id <> %s"
-        params.append(str(exclude_tenant_id))
-    cur.execute(
-        f"""
-        SELECT id
-        FROM tenants
-        WHERE regexp_replace(phone_number, '[^0-9]', '', 'g') = %s
-          {exclusion}
-        LIMIT 1
-        """,
-        params,
-    )
-    if cur.fetchone():
-        raise ValueError("tenant_did_already_exists")
-
-
-def _raise_if_slug_exists(cur, slug: str, exclude_tenant_id: Optional[UUID] = None) -> None:
-    params: list[Any] = [slug]
-    exclusion = ""
-    if exclude_tenant_id:
-        exclusion = "AND id <> %s"
-        params.append(str(exclude_tenant_id))
-    cur.execute(
-        f"""
-        SELECT id
-        FROM tenants
-        WHERE lower(slug) = lower(%s)
-          {exclusion}
-        LIMIT 1
-        """,
-        params,
-    )
-    if cur.fetchone():
-        raise ValueError("tenant_slug_already_exists")
-
-
-def _available_slug(cur, base_slug: str) -> str:
-    cur.execute(
-        """
-        SELECT slug
-        FROM tenants
-        WHERE lower(slug) = lower(%s)
-           OR lower(slug) LIKE lower(%s)
-        """,
-        (base_slug, f"{base_slug}-%"),
-    )
-    existing = {str(row[0]).lower() for row in cur.fetchall()}
-    if base_slug.lower() not in existing:
-        return base_slug
-    suffix = 2
-    while f"{base_slug}-{suffix}".lower() in existing:
-        suffix += 1
-    return f"{base_slug}-{suffix}"
+def _mask_phone(phone: str) -> str:
+    digits = [c for c in str(phone or "") if c.isdigit()]
+    if len(digits) <= 2:
+        return "XX"
+    masked = "X" * (len(digits) - 2) + "".join(digits[-2:])
+    return f"+{masked}" if str(phone).startswith("+") else masked

@@ -374,14 +374,14 @@ async def entrypoint(ctx: JobContext):
     tenant_id     = resolved_config.tenant_id
     did_masked    = mask_phone(dialed_did) if dialed_did else None
     set_correlation_context(call_id=call_id, tenant_id=str(tenant_id or ""), did=did_masked or "")
-    tenant_config_unavailable = (
+    tenant_unavailable = (
         is_postgres_enabled()
         and not tenant_id
         and resolved_config.fallback_reason
-        in {"tenant_not_configured", "postgres_error", "did_missing", "postgres_unavailable_or_unconfigured"}
+        in {"tenant_not_found", "tenant_not_configured", "postgres_error", "did_missing", "postgres_unavailable_or_unconfigured"}
     )
-    postgres_tenant_runtime = is_postgres_enabled() and (bool(tenant_id) or tenant_config_unavailable)
-    if tenant_config_unavailable:
+    postgres_tenant_runtime = is_postgres_enabled() and (bool(tenant_id) or tenant_unavailable)
+    if tenant_unavailable:
         if resolved_config.fallback_reason == "tenant_not_configured":
             fallback_line = "This number is not configured. Please contact support."
         else:
@@ -435,6 +435,19 @@ async def entrypoint(ctx: JobContext):
         },
     )
     logger.info(
+        "inbound.call.started",
+        extra={
+            "call_id": call_id,
+            "tenant_id": tenant_id,
+            "tenant_name": live_config.get("_tenant_name"),
+            "did": did_masked,
+            "caller_phone_masked": mask_phone(caller_phone),
+            "language": configured_language,
+            "llm_model": llm_model,
+            "voice": tts_voice,
+        },
+    )
+    logger.info(
         "latency.call_config",
         extra={
             "call_id": call_id,
@@ -452,7 +465,7 @@ async def entrypoint(ctx: JobContext):
 
     # ── Caller memory (#15) ───────────────────────────────────────────────
     async def get_caller_history(phone: str) -> str:
-        if tenant_config_unavailable:
+        if tenant_unavailable:
             return ""
         if phone == "unknown":
             return ""
@@ -525,8 +538,19 @@ async def entrypoint(ctx: JobContext):
     else:
         agent_llm = openai.LLM(model=llm_model, max_completion_tokens=120)  # cap tokens (#7)
         logger.info(f"[LLM] Using OpenAI: {llm_model}")
+    logger.info(
+        "openai.initialized" if llm_provider == "openai" else "llm.initialized",
+        extra={
+            "call_id": call_id,
+            "tenant_id": tenant_id,
+            "did": did_masked,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+        },
+    )
 
     # ── Build STT (#1 16kHz, #20 auto-detect, #9 Deepgram) ──────────────
+    actual_stt_provider = stt_provider
     if stt_provider == "deepgram":
         try:
             from livekit.plugins import deepgram
@@ -538,6 +562,7 @@ async def entrypoint(ctx: JobContext):
             logger.info("[STT] Using Deepgram Nova-2")
         except ImportError:
             logger.warning("[STT] deepgram plugin not installed — falling back to Sarvam")
+            actual_stt_provider = "sarvam"
             agent_stt = sarvam.STT(
                 language=stt_language,
                 model="saaras:v3",
@@ -553,9 +578,11 @@ async def entrypoint(ctx: JobContext):
             flush_signal=True,
             sample_rate=16000,          # force 16kHz (#1)
         )
+        actual_stt_provider = "sarvam"
         logger.info("[STT] Using Sarvam Saaras v3", extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "language": stt_language})
 
     # ── Build TTS (#2 24kHz, #10 ElevenLabs) ────────────────────────────
+    actual_tts_provider = tts_provider
     if tts_provider == "elevenlabs":
         try:
             from livekit.plugins import elevenlabs
@@ -567,6 +594,7 @@ async def entrypoint(ctx: JobContext):
             logger.info(f"[TTS] Using ElevenLabs Turbo v2.5 — voice: {_el_voice_id}")
         except ImportError:
             logger.warning("[TTS] elevenlabs plugin not installed — falling back to Sarvam")
+            actual_tts_provider = "sarvam"
             agent_tts = sarvam.TTS(
                 target_language_code=tts_language,
                 model="bulbul:v3",
@@ -580,9 +608,24 @@ async def entrypoint(ctx: JobContext):
             speaker=tts_voice,
             speech_sample_rate=24000,          # force 24kHz (#2)
         )
+        actual_tts_provider = "sarvam"
         logger.info(
             "[TTS] Using Sarvam Bulbul v3",
             extra={"call_id": call_id, "tenant_id": tenant_id, "did": did_masked, "voice": tts_voice, "language": tts_language},
+        )
+    if actual_stt_provider == "sarvam" or actual_tts_provider == "sarvam":
+        logger.info(
+            "sarvam.initialized",
+            extra={
+                "call_id": call_id,
+                "tenant_id": tenant_id,
+                "did": did_masked,
+                "stt_provider": actual_stt_provider,
+                "stt_language": stt_language,
+                "tts_provider": actual_tts_provider,
+                "tts_language": tts_language,
+                "voice": tts_voice,
+            },
         )
 
     # ── Sentence chunker (keep responses short for voice) ─────────────────

@@ -6,14 +6,13 @@ import hmac
 import time
 import threading
 from uuid import UUID
-import bcrypt
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, PlainTextResponse
 from dotenv import load_dotenv
 from backend.core.health import aggregate_health
 from backend.core.startup import run_startup_checks
-from backend.db.connection import get_connection, is_postgres_enabled
+from backend.db.connection import is_postgres_enabled
 from backend.logging import RequestTracingMiddleware, configure_logging, get_logger, init_sentry, set_correlation_context
 from backend.utils.formatting import mask_phone
 
@@ -221,34 +220,15 @@ async def _json_body(request: Request) -> dict:
         raise HTTPException(status_code=400, detail="JSON body must be an object")
     return data
 
-def _verify_password(password: str, stored_hash: str) -> bool:
-    if not stored_hash:
-        return False
-    if stored_hash.startswith("$2a$") or stored_hash.startswith("$2b$") or stored_hash.startswith("$2y$"):
-        try:
-            return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
-        except Exception:
-            return False
-    if stored_hash.startswith("pbkdf2_sha256$"):
-        try:
-            _, rounds, salt, digest = stored_hash.split("$", 3)
-            computed = hashlib.pbkdf2_hmac(
-                "sha256",
-                password.encode("utf-8"),
-                salt.encode("utf-8"),
-                int(rounds),
-            ).hex()
-            return hmac.compare_digest(computed, digest)
-        except Exception:
-            return False
-    if stored_hash.startswith("sha256$"):
-        try:
-            _, salt, digest = stored_hash.split("$", 2)
-            computed = hashlib.sha256(f"{salt}{password}".encode("utf-8")).hexdigest()
-            return hmac.compare_digest(computed, digest)
-        except Exception:
-            return False
-    return False
+def _dashboard_password() -> str:
+    return (os.environ.get("DASHBOARD_PASSWORD") or os.environ.get("ADMIN_PASSWORD") or "").strip()
+
+def _dashboard_email() -> str:
+    return (os.environ.get("DASHBOARD_EMAIL") or os.environ.get("ADMIN_EMAIL") or "").strip().lower()
+
+def _verify_dashboard_password(password: str) -> bool:
+    expected = _dashboard_password()
+    return bool(expected) and hmac.compare_digest(password, expected)
 
 def _postgres_login(email: str, password: str, tenant_slug: str | None = None) -> dict | None:
     if not is_postgres_enabled():
@@ -264,71 +244,41 @@ def _postgres_login(email: str, password: str, tenant_slug: str | None = None) -
             "Workspace is required. Use the workspace slug from signup.",
             status_code=400,
         )
+    expected_password = _dashboard_password()
+    if not expected_password:
+        raise AuthError(
+            "dashboard_password_missing",
+            "Dashboard password is not configured. Set DASHBOARD_PASSWORD in EasyPanel.",
+            status_code=503,
+            tenant_slug=workspace,
+        )
+    expected_email = _dashboard_email()
+    normalized_email = email.strip().lower()
+    if expected_email and normalized_email != expected_email:
+        raise AuthError(
+            "account_not_found",
+            "No dashboard account found for that email.",
+            status_code=404,
+            tenant_slug=workspace,
+        )
     try:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, name, slug, phone_number, is_active
-                    FROM tenants
-                    WHERE lower(slug) = lower(%s)
-                    LIMIT 1
-                    """,
-                    (workspace,),
-                )
-                tenant = cur.fetchone()
-                if tenant is None:
-                    raise AuthError(
-                        "workspace_not_found",
-                        "Workspace not found. Check your workspace slug.",
-                        status_code=404,
-                        tenant_slug=workspace,
-                    )
-                if not bool(tenant[4]):
-                    raise AuthError(
-                        "workspace_inactive",
-                        "Workspace is inactive. Contact support.",
-                        status_code=403,
-                        tenant_slug=tenant[2],
-                    )
-                cur.execute(
-                    """
-                    SELECT email, password_hash, tenant_id
-                    FROM users
-                    WHERE tenant_id = %s
-                      AND lower(email) = lower(%s)
-                    LIMIT 1
-                    """,
-                    (str(tenant[0]), email.strip()),
-                )
-                row = cur.fetchone()
-                if row is None:
-                    cur.execute(
-                        """
-                        SELECT t.slug
-                        FROM users u
-                        JOIN tenants t ON t.id = u.tenant_id
-                        WHERE lower(u.email) = lower(%s)
-                          AND lower(t.slug) <> lower(%s)
-                          AND t.is_active = TRUE
-                        LIMIT 1
-                        """,
-                        (email.strip(), workspace),
-                    )
-                    other_workspace = cur.fetchone()
-                    if other_workspace:
-                        raise AuthError(
-                            "wrong_workspace",
-                            "That email belongs to a different workspace.",
-                            status_code=403,
-                            tenant_slug=tenant[2],
-                        )
-                    raise AuthError(
-                        "account_not_found",
-                        "No account found for that email in this workspace.",
-                        status_code=404,
-                        tenant_slug=tenant[2],
-                    )
+        from backend.db.tenants import get_tenant_by_slug
+
+        tenant = get_tenant_by_slug(workspace)
+        if tenant is None:
+            raise AuthError(
+                "workspace_not_found",
+                "Workspace not found. Check your workspace slug.",
+                status_code=404,
+                tenant_slug=workspace,
+            )
+        if not bool(tenant.get("is_active", True)):
+            raise AuthError(
+                "workspace_inactive",
+                "Workspace is inactive. Contact support.",
+                status_code=403,
+                tenant_slug=tenant.get("slug") or workspace,
+            )
     except AuthError:
         raise
     except Exception as exc:
@@ -339,26 +289,19 @@ def _postgres_login(email: str, password: str, tenant_slug: str | None = None) -
             tenant_slug=workspace,
             error_type=type(exc).__name__,
         ) from exc
-    if not row:
-        raise AuthError(
-            "account_not_found",
-            "No account found for that email in this workspace.",
-            status_code=404,
-            tenant_slug=tenant[2],
-        )
-    if not _verify_password(password, row[1]):
+    if not _verify_dashboard_password(password):
         raise AuthError(
             "invalid_password",
             "Invalid password.",
             status_code=401,
-            tenant_slug=tenant[2],
+            tenant_slug=tenant.get("slug") or workspace,
         )
     return {
-        "email": row[0],
-        "tenant_id": str(row[2]),
-        "tenant_name": tenant[1],
-        "tenant_slug": tenant[2],
-        "tenant_phone": tenant[3] or "",
+        "email": expected_email or normalized_email,
+        "tenant_id": str(tenant["id"]),
+        "tenant_name": tenant.get("name") or "",
+        "tenant_slug": tenant.get("slug") or workspace,
+        "tenant_phone": tenant.get("phone_number") or "",
     }
 
 def _authenticate(email: str, password: str, tenant_slug: str | None = None) -> dict | None:
@@ -469,10 +412,10 @@ def _postgres_config_for_response(session: dict) -> dict | None:
     if not tenant_id or not is_postgres_enabled():
         return None
     try:
-        from backend.db.tenants import get_tenant_by_id, get_tenant_config
+        from backend.db.tenants import get_runtime_config, get_tenant_by_id
 
         tenant = get_tenant_by_id(tenant_id)
-        cfg = get_tenant_config(tenant_id) or {}
+        cfg = get_runtime_config(tenant_id) or {}
     except Exception as exc:
         logger.warning("Tenant config fetch failed: %s", type(exc).__name__)
         return None
@@ -533,9 +476,9 @@ def _update_postgres_config(session: dict, data: dict) -> bool:
         tenant_updates["phone_number"] = data["business_phone"]
 
     if updates:
-        from backend.db.tenants import update_tenant_config
+        from backend.db.tenants import update_runtime_config
 
-        update_tenant_config(tenant_id, updates)
+        update_runtime_config(tenant_id, updates)
 
     if tenant_updates:
         from backend.db.tenants import update_tenant
@@ -616,7 +559,7 @@ async def api_auth_logout(response: Response):
 
 @app.post("/api/auth/signup")
 async def api_auth_signup(request: Request, response: Response):
-    """Self-serve account creation. Provisions tenant + user + tenant_config in one transaction.
+    """Self-serve tenant creation for the single-table MVP.
 
     Required fields: name (full name or business name), company, phone_number, email, password.
     Returns 503 when Postgres is disabled (signup requires real DB persistence).
@@ -662,7 +605,7 @@ async def api_auth_signup(request: Request, response: Response):
             is_active=True,
         )
     except ValueError as exc:
-        # provision_tenant raises ValueError on duplicate phone/email/slug
+        # provision_tenant raises ValueError on duplicate phone/DID.
         raise HTTPException(status_code=409, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         logger.error("signup.failed", extra={"error_type": type(exc).__name__})
@@ -693,18 +636,13 @@ async def api_auth_session(user: dict = Depends(require_session)):
 async def api_internal_auth_runtime(request: Request):
     _require_internal_access(request)
     database_url = os.environ.get("DATABASE_URL", "").strip()
-    stale_auth_env = sorted(
+    dashboard_auth_env = sorted(
         name
         for name in (
             "DASHBOARD_EMAIL",
             "DASHBOARD_PASSWORD",
             "ADMIN_EMAIL",
             "ADMIN_PASSWORD",
-            "DASHBOARD_TENANT_ID",
-            "DASHBOARD_TENANT_SLUG",
-            "DASHBOARD_TENANT_NAME",
-            "DASHBOARD_TENANT_PHONE",
-            "DASHBOARD_BUSINESS_PHONE",
         )
         if os.environ.get(name)
     )
@@ -720,7 +658,7 @@ async def api_internal_auth_runtime(request: Request):
         "database_url_present": bool(database_url),
         "database_url_fingerprint": hashlib.sha256(database_url.encode("utf-8")).hexdigest()[:16] if database_url else "",
         "api_base_url": os.environ.get("API_BASE_URL", ""),
-        "legacy_auth_env_present": stale_auth_env,
+        "dashboard_auth_env_present": dashboard_auth_env,
         "postgres": postgres,
     }
 

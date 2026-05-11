@@ -1,37 +1,25 @@
-"""Deterministic runtime config resolution for Phase 3B.
-
-Priority:
-1. PostgreSQL tenant_config, when USE_POSTGRES=true and a tenant is resolved.
-2. Existing JSON config files, preserving the legacy lookup order.
-3. Built-in environment-safe defaults that match the current voice runtime.
-
-This module is intentionally small and side-effect free. It does not mutate
-os.environ, does not cache, and never raises from PostgreSQL failures; live
-calls must fall back to the legacy config path if Postgres is unavailable.
-"""
+"""Simple runtime config resolution from the single `tenants` table."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from dataclasses import dataclass
 from typing import Any, Optional
-from uuid import UUID
 
-from backend.db.connection import is_postgres_enabled
 from backend.db import tenants as tenant_repo
-from backend.services.tenant_service import TenantNotConfiguredError, TenantService
+from backend.db.connection import is_postgres_enabled
 from backend.utils.formatting import mask_phone
 from backend.utils.logging import get_logger
 
 logger = get_logger("backend.core.config_resolver")
 
-CONFIG_FILE = "config.json"
+
+SAFE_FALLBACK_FIRST_LINE = "We are unable to load this number's configuration right now. Please call again later."
 
 _DEFAULT_CONFIG: dict[str, Any] = {
     "agent_instructions": "",
-    "first_line": "We are unable to load this number's configuration right now. Please call again later.",
+    "first_line": SAFE_FALLBACK_FIRST_LINE,
     "stt_min_endpointing_delay": 0.2,
     "llm_model": "gpt-4o-mini",
     "llm_provider": "openai",
@@ -42,20 +30,6 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "stt_language": "unknown",
     "lang_preset": "multilingual",
     "max_turns": 25,
-}
-
-_TENANT_CONFIG_KEY_MAP = {
-    "agent_instructions": "agent_instructions",
-    "first_line": "first_line",
-    "tts_voice": "tts_voice",
-    "tts_language": "tts_language",
-    "lang_preset": "lang_preset",
-    "llm_model": "llm_model",
-    "endpointing_delay": "stt_min_endpointing_delay",
-    "transfer_number": "transfer_number",
-    "cal_api_key": "cal_api_key",
-    "cal_event_type_id": "cal_event_type_id",
-    "business_hours_json": "business_hours_json",
 }
 
 
@@ -73,39 +47,22 @@ def resolve_runtime_config(
     caller_phone: Optional[str] = None,
     did: Optional[str] = None,
 ) -> ResolvedRuntimeConfig:
-    """Resolve call-start config without changing the existing call flow."""
-    if is_postgres_enabled():
-        if did:
-            resolved, fallback_reason = _try_postgres_config(did=did)
-            if resolved is not None:
-                return resolved
-            return _json_result(
-                dict(_DEFAULT_CONFIG),
-                "environment_defaults",
-                fallback_reason=fallback_reason or "postgres_unavailable_or_unconfigured",
-                did=did,
-            )
-
-        logger.info(
-            "config.source.selected",
-            extra={
-                "source": "environment_defaults",
-                "postgres_enabled": True,
-                "fallback_reason": "did_missing",
-            },
+    """Synchronous wrapper used by scripts/tests."""
+    _ = caller_phone
+    if not is_postgres_enabled():
+        return _fallback_result("postgres_disabled", did=did)
+    if not did:
+        logger.warning("tenant.resolve.skipped", extra={"fallback_reason": "did_missing"})
+        return _fallback_result("did_missing")
+    try:
+        tenant = tenant_repo.get_tenant_by_did(did)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "tenant.resolve.error",
+            extra={"did_masked": mask_phone(did), "error_type": type(exc).__name__},
         )
-        return _json_result(
-            dict(_DEFAULT_CONFIG),
-            "environment_defaults",
-            fallback_reason="did_missing",
-        )
-
-    json_config, json_source = _load_json_config(caller_phone)
-    logger.info(
-        "config.source.selected",
-        extra={"source": json_source, "postgres_enabled": False},
-    )
-    return _json_result(json_config, json_source)
+        return _fallback_result("postgres_error", did=did)
+    return _result_from_tenant(tenant, did=did)
 
 
 async def get_tenant_by_did(did: str) -> Optional[dict]:
@@ -113,247 +70,96 @@ async def get_tenant_by_did(did: str) -> Optional[dict]:
     return await asyncio.to_thread(tenant_repo.get_tenant_by_did, did)
 
 
-async def load_tenant_config(tenant_id: str) -> Optional[dict]:
-    """Load one tenant_config row without blocking the event loop."""
-    return await asyncio.to_thread(tenant_repo.get_tenant_config, UUID(str(tenant_id)))
-
-
 async def resolve_runtime_config_async(
     *,
     caller_phone: Optional[str] = None,
     did: Optional[str] = None,
 ) -> ResolvedRuntimeConfig:
-    """Async call-start config resolution for the LiveKit worker."""
-    if is_postgres_enabled():
-        if did:
-            resolved, fallback_reason = await _try_postgres_config_async(did=did)
-            if resolved is not None:
-                return resolved
-            return _json_result(
-                dict(_DEFAULT_CONFIG),
-                "environment_defaults",
-                fallback_reason=fallback_reason or "postgres_unavailable_or_unconfigured",
-                did=did,
-            )
-
-        logger.info(
-            "config.source.selected",
-            extra={
-                "source": "environment_defaults",
-                "postgres_enabled": True,
-                "fallback_reason": "did_missing",
-            },
+    """Resolve tenant prompt/voice/language for an inbound call."""
+    _ = caller_phone
+    if not is_postgres_enabled():
+        return _fallback_result("postgres_disabled", did=did)
+    if not did:
+        logger.warning("tenant.resolve.skipped", extra={"fallback_reason": "did_missing"})
+        return _fallback_result("did_missing")
+    try:
+        tenant = await get_tenant_by_did(did)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "tenant.resolve.error",
+            extra={"did_masked": mask_phone(did), "error_type": type(exc).__name__},
         )
-        return _json_result(
-            dict(_DEFAULT_CONFIG),
-            "environment_defaults",
-            fallback_reason="did_missing",
-        )
-
-    json_config, json_source = _load_json_config(caller_phone)
-    logger.info(
-        "config.source.selected",
-        extra={"source": json_source, "postgres_enabled": False},
-    )
-    return _json_result(json_config, json_source)
+        return _fallback_result("postgres_error", did=did)
+    return _result_from_tenant(tenant, did=did)
 
 
 def get_config_source_status() -> dict[str, Any]:
-    """Return lightweight config-source status for `/health`.
-
-    This does not query PostgreSQL. Tenant config is resolved only at call
-    start when a DID exists.
-    """
-    postgres_enabled = is_postgres_enabled()
-    json_source = "disabled_when_postgres_enabled"
-    if not postgres_enabled:
-        _, json_source = _load_json_config(None)
     return {
-        "postgres_enabled": postgres_enabled,
-        "json_source": json_source,
-        "effective_priority": (
-            ["postgres_tenant_config", "environment_defaults"]
-            if postgres_enabled
-            else ["json_config", "environment_defaults"]
-        ),
+        "postgres_enabled": is_postgres_enabled(),
+        "json_source": "disabled",
+        "effective_priority": ["tenants_table", "safe_fallback"],
     }
 
 
-def _try_postgres_config(
-    *,
-    did: str,
-) -> tuple[Optional[ResolvedRuntimeConfig], Optional[str]]:
-    try:
-        resolved = TenantService().resolve_from_did(did)
-    except TenantNotConfiguredError:
+def _result_from_tenant(tenant: Optional[dict], *, did: str) -> ResolvedRuntimeConfig:
+    if tenant is None:
         logger.warning(
-            "tenant.resolve.fallback",
-            extra={
-                "did_masked": mask_phone(did),
-                "fallback_reason": "tenant_not_configured",
-            },
+            "tenant.resolve.not_found",
+            extra={"did_masked": mask_phone(did), "fallback_reason": "tenant_not_found"},
         )
-        return None, "tenant_not_configured"
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "tenant.resolve.error",
-            extra={
-                "did_masked": mask_phone(did),
-                "fallback_reason": "postgres_error",
-                "error_type": type(exc).__name__,
-            },
-        )
-        return None, "postgres_error"
+        return _fallback_result("tenant_not_found", did=did)
 
-    return _postgres_result_from_rows(
-        tenant=resolved["tenant"],
-        tenant_config=resolved["config"],
-        did=did,
-    ), None
-
-
-async def _try_postgres_config_async(
-    *,
-    did: str,
-) -> tuple[Optional[ResolvedRuntimeConfig], Optional[str]]:
-    try:
-        tenant = await get_tenant_by_did(did)
-        if tenant is None:
-            logger.warning(
-                "tenant.resolve.fallback",
-                extra={
-                    "did_masked": mask_phone(did),
-                    "fallback_reason": "tenant_not_configured",
-                },
-            )
-            return None, "tenant_not_configured"
-
-        tenant_config = await load_tenant_config(str(tenant["id"]))
-        if tenant_config is None:
-            logger.error(
-                "tenant.config.missing",
-                extra={"tenant_id": str(tenant["id"]), "did_masked": mask_phone(did)},
-            )
-            return None, "tenant_not_configured"
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "tenant.resolve.error",
-            extra={
-                "did_masked": mask_phone(did),
-                "fallback_reason": "postgres_error",
-                "error_type": type(exc).__name__,
-            },
-        )
-        return None, "postgres_error"
-
-    return _postgres_result_from_rows(
-        tenant=tenant,
-        tenant_config=tenant_config,
-        did=did,
-    ), None
-
-
-def _postgres_result_from_rows(
-    *,
-    tenant: dict[str, Any],
-    tenant_config: dict[str, Any],
-    did: str,
-) -> ResolvedRuntimeConfig:
     tenant_id = str(tenant["id"])
-    merged = _merge_config({}, _normalize_tenant_config(tenant_config))
-    merged["_tenant_id"] = tenant_id
-    merged["_tenant_name"] = tenant.get("name")
-    merged["_tenant_slug"] = tenant.get("slug")
-    merged["_config_source"] = "postgres"
-    merged["_did"] = did
-    if tenant.get("name"):
-        merged["business_name"] = tenant["name"]
-    if tenant.get("phone_number"):
-        merged["business_phone"] = tenant["phone_number"]
-
+    config = dict(_DEFAULT_CONFIG)
+    config.update(
+        {
+            "agent_instructions": tenant.get("system_prompt") or tenant.get("agent_instructions") or "",
+            "first_line": tenant.get("welcome_message") or tenant.get("first_line") or SAFE_FALLBACK_FIRST_LINE,
+            "tts_voice": tenant.get("voice") or tenant.get("tts_voice") or "kavya",
+            "tts_language": tenant.get("tts_language") or "hi-IN",
+            "stt_language": tenant.get("stt_language") or "unknown",
+            "lang_preset": tenant.get("languages") or tenant.get("lang_preset") or "multilingual",
+            "llm_model": os.environ.get("DEFAULT_LLM_MODEL", "gpt-4o-mini"),
+            "stt_min_endpointing_delay": float(os.environ.get("DEFAULT_ENDPOINTING_DELAY", "0.5")),
+            "business_name": tenant.get("name"),
+            "business_phone": tenant.get("phone_number"),
+            "_tenant_id": tenant_id,
+            "_tenant_name": tenant.get("name"),
+            "_tenant_slug": tenant.get("slug"),
+            "_config_source": "postgres.tenants",
+            "_did": did,
+        }
+    )
     logger.info(
-        "config.source.selected",
+        "tenant.loaded",
         extra={
-            "source": "postgres",
-            "postgres_enabled": True,
             "tenant_id": tenant_id,
+            "tenant_name": tenant.get("name"),
             "did_masked": mask_phone(did),
+            "languages": tenant.get("languages"),
+            "voice": tenant.get("voice"),
         },
     )
-    return ResolvedRuntimeConfig(
-        config=merged,
-        source="postgres",
-        tenant_id=tenant_id,
-        did=did,
+    logger.info(
+        "prompt.loaded",
+        extra={
+            "tenant_id": tenant_id,
+            "prompt_chars": len(config["agent_instructions"]),
+            "welcome_chars": len(config["first_line"]),
+        },
     )
+    return ResolvedRuntimeConfig(config=config, source="postgres.tenants", tenant_id=tenant_id, did=did)
 
 
-def _load_json_config(phone_number: Optional[str]) -> tuple[dict[str, Any], str]:
-    config: dict[str, Any] = {}
-    source = "environment_defaults"
-
-    for path in _legacy_config_paths(phone_number):
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            source = path
-            break
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "config.json.read_failed",
-                extra={"path": path, "error_type": type(exc).__name__},
-            )
-
-    return _merge_config(config), source
-
-
-def _legacy_config_paths(phone_number: Optional[str]) -> list[str]:
-    paths: list[str] = []
-    if phone_number and phone_number != "unknown":
-        clean = phone_number.replace("+", "").replace(" ", "")
-        paths.append(f"configs/{clean}.json")
-    paths.extend(["configs/default.json", CONFIG_FILE])
-    return paths
-
-
-def _merge_config(
-    json_config: dict[str, Any],
-    postgres_config: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    merged = dict(_DEFAULT_CONFIG)
-    merged.update(json_config)
-    if postgres_config:
-        merged.update(postgres_config)
-    return merged
-
-
-def _normalize_tenant_config(tenant_config: dict[str, Any]) -> dict[str, Any]:
-    normalized: dict[str, Any] = {}
-    for db_key, runtime_key in _TENANT_CONFIG_KEY_MAP.items():
-        value = tenant_config.get(db_key)
-        if value is not None and value != "":
-            normalized[runtime_key] = value
-    return normalized
-
-
-def _json_result(
-    config: dict[str, Any],
-    source: str,
-    *,
-    fallback_reason: Optional[str] = None,
-    did: Optional[str] = None,
-) -> ResolvedRuntimeConfig:
-    result = dict(config)
-    result["_config_source"] = source
-    if fallback_reason:
-        result["_config_fallback_reason"] = fallback_reason
+def _fallback_result(reason: str, *, did: Optional[str] = None) -> ResolvedRuntimeConfig:
+    config = dict(_DEFAULT_CONFIG)
+    config["_config_source"] = "safe_fallback"
+    config["_config_fallback_reason"] = reason
     if did:
-        result["_did"] = did
+        config["_did"] = did
     return ResolvedRuntimeConfig(
-        config=result,
-        source=source,
+        config=config,
+        source="safe_fallback",
         did=did,
-        fallback_reason=fallback_reason,
+        fallback_reason=reason,
     )
