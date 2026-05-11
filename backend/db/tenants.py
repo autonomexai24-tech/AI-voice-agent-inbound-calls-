@@ -80,6 +80,7 @@ def ensure_tenants_schema() -> None:
             ):
                 cur.execute(statement)
             cur.execute("UPDATE tenants SET slug = regexp_replace(lower(trim(name)), '[^a-z0-9]+', '-', 'g') WHERE slug = ''")
+            _deactivate_duplicate_active_slugs(cur)
             cur.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_phone_digits
@@ -130,21 +131,29 @@ def seed_default_tenant_from_env() -> Optional[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id
+                SELECT id, slug
                 FROM tenants
-                WHERE regexp_replace(phone_number, '[^0-9]', '', 'g') = %s
+                WHERE lower(slug) = lower(%s)
+                   OR regexp_replace(phone_number, '[^0-9]', '', 'g') = %s
+                ORDER BY
+                    CASE WHEN lower(slug) = lower(%s) THEN 0 ELSE 1 END,
+                    is_active DESC,
+                    created_at ASC,
+                    id::text ASC
                 LIMIT 1
                 """,
-                (phone_digits,),
+                (slug, phone_digits, slug),
             )
             existing = cur.fetchone()
             if existing:
+                tenant_id = str(existing[0])
+                logger.info("tenant.exists", extra={"tenant_id": tenant_id, "tenant_slug": slug})
                 cur.execute(
                     """
                     UPDATE tenants
                     SET name = COALESCE(NULLIF(name, ''), %s),
                         slug = COALESCE(NULLIF(slug, ''), %s),
-                        phone_number = %s,
+                        phone_number = COALESCE(NULLIF(phone_number, ''), %s),
                         system_prompt = COALESCE(NULLIF(system_prompt, ''), %s),
                         welcome_message = COALESCE(NULLIF(welcome_message, ''), %s),
                         languages = COALESCE(NULLIF(languages, ''), %s),
@@ -162,17 +171,35 @@ def seed_default_tenant_from_env() -> Optional[dict]:
                         languages,
                         voice,
                         llm_model,
-                        str(existing[0]),
+                        tenant_id,
                     ),
                 )
+                cur.execute(
+                    """
+                    UPDATE tenants
+                    SET is_active = FALSE
+                    WHERE id <> %s
+                      AND is_active = TRUE
+                      AND lower(slug) = lower(%s)
+                    """,
+                    (tenant_id, slug),
+                )
+                logger.info("tenant.seed.skipped", extra={"tenant_id": tenant_id, "tenant_slug": slug})
             else:
                 cur.execute(
                     """
                     INSERT INTO tenants (name, slug, phone_number, system_prompt, welcome_message, languages, voice, llm_model, is_active)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id
                     """,
                     (name, slug, normalized_phone, system_prompt, welcome_message, languages, voice, llm_model),
                 )
+                inserted = cur.fetchone()
+                if inserted:
+                    logger.info("tenant.created", extra={"tenant_id": str(inserted[0]), "tenant_slug": slug})
+                else:
+                    logger.info("tenant.seed.skipped", extra={"tenant_slug": slug, "reason": "conflict"})
 
     tenant = get_tenant_by_did(normalized_phone)
     logger.info(
@@ -180,6 +207,54 @@ def seed_default_tenant_from_env() -> Optional[dict]:
         extra={"tenant_id": str((tenant or {}).get("id") or ""), "phone_number_masked": _mask_phone(normalized_phone)},
     )
     return tenant
+
+
+def _deactivate_duplicate_active_slugs(cur) -> None:
+    """Keep one active tenant per slug so the startup unique index can exist."""
+    cur.execute(
+        """
+        WITH ranked AS (
+            SELECT
+                id,
+                lower(slug) AS slug_key,
+                row_number() OVER (
+                    PARTITION BY lower(slug)
+                    ORDER BY
+                        CASE
+                            WHEN NULLIF(system_prompt, '') IS NOT NULL
+                             AND NULLIF(welcome_message, '') IS NOT NULL
+                            THEN 0
+                            ELSE 1
+                        END,
+                        created_at ASC,
+                        id::text ASC
+                ) AS row_number
+            FROM tenants
+            WHERE is_active = TRUE
+              AND NULLIF(slug, '') IS NOT NULL
+        ),
+        deactivated AS (
+            UPDATE tenants AS tenant
+            SET is_active = FALSE
+            FROM ranked
+            WHERE tenant.id = ranked.id
+              AND ranked.row_number > 1
+            RETURNING ranked.slug_key
+        )
+        SELECT slug_key, count(*) AS deactivated_count
+        FROM deactivated
+        GROUP BY slug_key
+        """
+    )
+    for slug_key, deactivated_count in cur.fetchall():
+        logger.info(
+            "tenant.seed.skipped",
+            extra={
+                "tenant_slug": slug_key,
+                "reason": "duplicate_active_slug_deactivated",
+                "deactivated_count": int(deactivated_count or 0),
+            },
+        )
 
 
 def get_tenant_by_did(phone_number: str) -> Optional[dict]:
